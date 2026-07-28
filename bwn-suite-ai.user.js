@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - AI (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.42.1
+// @version      1.42.2
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-ai.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-ai.user.js
 // @description  The Umbrava tools that call outside APIs, kept separate from the zero-egress Core script. Client Update and WO Audit drafts (Anthropic Claude; draft-only, scrubbed before sending, you review before posting); Find Techs / Find Suppliers (Google Places; vendor leads near a WO); and Job View (opens the Ops-Dashboard job card on the WO page - WO details from Umbrava plus the authored case file and next actions, read-only). Network access is limited by the browser to the declared API hosts and the BWN Static Web App. API keys are stored in Tampermonkey's storage via the menu commands and never enter the page. Toggle modules in BWN_MODULES below.
@@ -993,13 +993,6 @@
       document.addEventListener('bwn:evt', function (e) {
         var d = e && e.detail;
         if (d && d.id === 'bwn:role' && typeof d.rank === 'number') _liveRank = d.rank;
-        // Another tool claimed the shared drawer slot - fold ours away.
-        if (d && d.id === 'bwn:drawer:open') {
-          if (d.key !== 'findtechs') { var p = document.getElementById('bwn-ft-panel'); if (p) p.remove(); }
-          if (d.key !== 'jobview') { var jv = document.getElementById('bwn-jv-overlay'); if (jv) jv.remove(); }
-          if (d.key !== 'clientupdate') { var cu = document.getElementById('bwn-cu-overlay'); if (cu) cu.remove(); }
-          if (d.key !== 'over30') { var o3 = document.getElementById('bwn-o30b-overlay'); if (o3) o3.remove(); }
-        }
       });
     } catch (e) { /* no document (worker) - rank stays unknown -> on-device */ }
     function rank() {
@@ -1126,6 +1119,21 @@
     return bwnAI;
   })();
   // ===== END bwnAI =====
+
+  // Drawer slot contract (bwn:drawer:open): another tool claimed the shared slot - fold this
+  // script's surfaces away. Lives OUTSIDE the bwnAI block on purpose: PAT-002 keeps that block
+  // byte-identical across drop-upload/suite-ai/wo-audit, and this listener is suite-ai-only.
+  try {
+    document.addEventListener('bwn:evt', function (e) {
+      var d = e && e.detail;
+      if (d && d.id === 'bwn:drawer:open') {
+        if (d.key !== 'findtechs') { var p = document.getElementById('bwn-ft-panel'); if (p) p.remove(); }
+        if (d.key !== 'jobview') { var jv = document.getElementById('bwn-jv-overlay'); if (jv) jv.remove(); }
+        if (d.key !== 'clientupdate') { var cu = document.getElementById('bwn-cu-overlay'); if (cu) cu.remove(); }
+        if (d.key !== 'over30') { var o3 = document.getElementById('bwn-o30b-overlay'); if (o3) o3.remove(); }
+      }
+    });
+  } catch (e) { /* no document (worker) - nothing to fold */ }
 
   // ---- Tool registry (TASK-007) --------------------------------------------------------
   // Each tool is function(input) -> Promise<{ok, content}>, executed IN-PAGE against
