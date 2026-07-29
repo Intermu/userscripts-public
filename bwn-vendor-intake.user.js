@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Vendor Intake (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.8.5
+// @version      0.8.6
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-vendor-intake.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-vendor-intake.user.js
 // @description  Prefills Umbrava's Create Vendor form (and the detail-page Tax ID) from a Prospect Set-Up Form or a W-9. Fillable PDFs are read straight from their form fields; SCANNED W-9s are read by on-device OCR (Tesseract + pdf.js, fetched once at install, run entirely in the browser). The document and its tax ID never leave your machine. Adds a "Prefill from document" button; every extracted field is a suggestion to review before saving - the TIN especially, since OCR can misread digits.
@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VER = '0.8.4';
+  var VER = '0.8.6';
   // v0.4.0 - real IRS fillable W-9 support: map by FIELD NAME (UTF-16BE-decoded f1_/c1_1 names)
   // after inflating compressed object streams, since the IRS form carries no /TU tooltips; the
   // tooltip mapping stays as a fallback for other fillable forms. Also fixed stream inflation to
@@ -149,6 +149,24 @@
     var s = String(text || '');
     var ein = s.match(/\b(\d{2}-\d{7})\b/); if (ein) return { tin: ein[1], kind: 'ein' };
     var ssn = s.match(/\b(\d{3}-\d{2}-\d{4})\b/); if (ssn) return { tin: ssn[1], kind: 'ssn' };
+    // Scanned forms: the TIN is written in per-digit comb boxes, so OCR emits digits split by
+    // spaces/box artifacts under the caption. Probe a short window AFTER each caption (EIN first:
+    // it is the last caption before Part II, so anything in its window is the EIN). The window is
+    // cut at the other caption so a probe can never claim digits that sit under the other one,
+    // and digit-confusion fixups apply only INSIDE the window - never to the captions themselves.
+    // Pipes are box edges first, digit 1s second (two-pass).
+    function run9(w) { var r = w.match(/(?<!\d)\d(?:[\s|.,_\/\\-]{0,3}\d){8}(?!\d)/); return r ? r[0].replace(/\D/g, '') : ''; }
+    function boxed(capRe, kind) {
+      var m = capRe.exec(s); if (!m) return null;
+      var win = s.slice(m.index + m[0].length, m.index + m[0].length + 120)
+        .split(/social security|employer identification/i)[0]
+        .replace(/[OoQ]/g, '0').replace(/[lI]/g, '1').replace(/S/g, '5').replace(/B/g, '8').replace(/Z/g, '2');
+      var d = run9(win) || run9(win.replace(/\|/g, '1'));
+      if (d.length === 9) return { tin: kind === 'ssn' ? d.slice(0, 3) + '-' + d.slice(3, 5) + '-' + d.slice(5) : d.slice(0, 2) + '-' + d.slice(2), kind: kind };
+      return null;
+    }
+    var r = boxed(/employer identification number/i, 'ein') || boxed(/social security number/i, 'ssn');
+    if (r) return r;
     var m = s.match(/(?:EIN|employer identification|TIN|tax\s*id)\D{0,12}(\d[\d\s-]{7,}\d)/i);
     if (m) { var d = m[1].replace(/\D/g, ''); if (d.length === 9) return { tin: d.slice(0, 2) + '-' + d.slice(2), kind: 'ein' }; }
     return { tin: '', kind: '' };
@@ -376,14 +394,18 @@
     }
     return text;
   }
-  // Pull W-9 fields from OCR (or any) free text. Best-effort + label-anchored; the TIN region
-  // gets digit-confusion fixups (O->0 etc.) before matching. Everything is a SUGGESTION.
+  // Pull W-9 fields from OCR (or any) free text. Best-effort + label-anchored; digit-confusion
+  // fixups happen inside findTIN's caption windows. Everything is a SUGGESTION.
   function extractW9FromText(text) {
     var raw = String(text || '').replace(/\r/g, '');
     var out = { name: '', dba: '', entity: '', street: '', city: '', state: '', zip: '', tin: '', tinKind: '' };
     // On a scanned W-9 the value is on the line(s) AFTER the label, so skip past the label's
     // own line, then return the first substantive line that isn't itself label boilerplate.
-    var LABEL_NOISE = /required on this line|as shown on|do not leave|if different|disregarded entity|check (the )?appropriate|number, street|apt\.?\s*or suite|see instructions|^\d+$/i;
+    // The noise list covers BOTH the Oct-2018 and Mar-2024 revisions - 2024 moved a wrapping
+    // "(For a sole proprietor or disregarded entity, ... name on line 2.)" instruction into the
+    // line-1 label, and its fragments land on their own OCR lines wherever the wrap falls.
+    // ^\d+[ab]?$ also swallows the bare "3a"/"3b" item numbers 2024 introduced.
+    var LABEL_NOISE = /required on this line|as shown on|do not leave|this line blank|if different|disregarded entity|name on line \d|owner'?s name|entry is required|sole propriet|check (the )?appropriate|number, street|apt\.?\s*or suite|see instructions|^\d+[ab]?$/i;
     function seg(startRe, stopRe) {
       var m = startRe.exec(raw); if (!m) return '';
       var rest = raw.slice(m.index + m[0].length);
@@ -391,23 +413,23 @@
       var after = nl >= 0 ? rest.slice(nl + 1) : '';
       var stop = stopRe ? after.search(stopRe) : -1;
       var chunk = (stop >= 0 ? after.slice(0, stop) : after);
-      var lines = chunk.split(/\n/).map(function (l) { return l.replace(/^[\s:.\-]+/, '').trim(); }).filter(Boolean);
+      // Tesseract puts blank lines between a label block and its typed value, so stopping at a
+      // paragraph break loses the value - instead cap the scan at 4 candidate lines.
+      var lines = chunk.split(/\n/).map(function (l) { return l.replace(/^[\s:.\-]+/, '').trim(); }).filter(Boolean).slice(0, 4);
       for (var i = 0; i < lines.length; i++) { if (!LABEL_NOISE.test(lines[i])) return lines[i]; }
       return '';
     }
-    var NEXT = /\n\s*\n|business name|federal tax|check (the )?appropriate|exempt|address|city,|requester|part i|taxpayer identification|social security|employer identification/i;
+    var NEXT = /business name|federal tax|check (the )?appropriate|exempt|address|city,|requester|part i|taxpayer identification|social security|employer identification/i;
     out.name = seg(/name\s*\(as shown[^)]*\)|^\s*1\s+name\b|name of entity\/individual/im, NEXT);
-    out.dba = seg(/business name[^\n]*|disregarded entity[^\n]*/i, /\n\s*\n|federal tax|check (the )?appropriate|exempt|address|city,/i);
-    out.street = seg(/address\s*\(number[^)]*\)|^\s*5\s+address\b/im, /\n\s*\n|city,|requester|part/i);
-    var csz = seg(/city,\s*state,?\s*and\s*zip[^\n]*|^\s*6\s+city\b/im, /\n\s*\n|requester|part/i);
+    // Anchor DBA to the real line-2 label: the 2024 line-1 instruction also contains
+    // "business/disregarded entity's name", and a loose match latched onto it.
+    out.dba = seg(/^\s*2\s*business name[^\n]*|business name\s*\/\s*disregarded[^\n]*|^\s*2\s*disregarded entity[^\n]*/im, /federal tax|check (the )?appropriate|exempt|address|city,/i);
+    out.street = seg(/address\s*\(number[^)]*\)|^\s*5\s+address\b/im, /city,|requester|part/i);
+    var csz = seg(/city,\s*state,?\s*and\s*zip[^\n]*|^\s*6\s+city\b/im, /requester|part/i);
     if (csz) { var mz = csz.match(/(.+?),?\s*([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)/); if (mz) { out.city = mz[1].replace(/,\s*$/, '').trim(); out.state = mz[2].toUpperCase(); out.zip = mz[3]; } else out.city = csz; }
     var mk = raw.match(/(?:\[x\]|\bx\b\s*|☒|■|✔|✓)\s*(individual|sole propriet|c corporation|s corporation|partnership|trust|estate|limited liability|llc)/i);
     if (mk) out.entity = classToEntity(mk[1]);
-    // TIN: fix common digit misreads only within a window near a TIN label, then findTIN.
-    var numFixed = raw.replace(/(?:SSN|social security|EIN|employer identification|TIN|tax\s*id\.?)[\s\S]{0,40}/ig, function (chunk) {
-      return chunk.replace(/[OoQ]/g, '0').replace(/[lI|]/g, '1').replace(/S/g, '5').replace(/B/g, '8').replace(/Z/g, '2');
-    });
-    var tt = findTIN(numFixed); out.tin = tt.tin; out.tinKind = tt.kind;
+    var tt = findTIN(raw); out.tin = tt.tin; out.tinKind = tt.kind;
     return out;
   }
 
