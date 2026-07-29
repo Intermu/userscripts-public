@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.11
+// @version      1.66.12
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -44,7 +44,7 @@
   try { localStorage.setItem('bwn:status:core', JSON.stringify({ ver: BWN_VER, ts: Date.now() })); } catch (e) { /* best-effort */ }
 
   console.info('[BWN SUITE CORE] v' + BWN_VER + ' |',
-    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.61 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.16 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
+    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.62 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.16 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
     'enabled:', Object.keys(BWN_MODULES).filter(function (k) { return BWN_MODULES[k]; }).join(', '));
 
   // ===== BWN SHARED CORE v7 - KEEP IN SYNC across both suite scripts =====
@@ -1091,7 +1091,7 @@
   });
 
   // ==========================================================================
-  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.61 (Connector 1.2)
+  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.62 (Connector 1.2)
   // ==========================================================================
   if (BWN_MODULES.woAssist) BWN.safeModule('woAssist', function () {
     'use strict';
@@ -1121,7 +1121,7 @@
     var PANEL_ID = 'bwn-gp-panel';
     var GREEN = BWN.GREEN;
 
-    console.info('[BWN GP] WO Assist v2.61 loaded on', location.href);
+    console.info('[BWN GP] WO Assist v2.62 loaded on', location.href);
 
     // ---- Parsing helpers (shared via BWN core) -----------------------------
     var parseMoney = BWN.parseMoney;
@@ -3423,8 +3423,16 @@
       // so this must NOT imply the job is ready to close (it can be mid-lifecycle).
       hc.textContent = realOpen ? realOpen + ' open' : (open ? 'no open steps' : 'all done ✓');
       var hs = document.createElement('span'); hs.className = 'bwn-actc-s';
-      hs.textContent = acts.some(function (a) { return a.authored && String(a.planRef || '').indexOf('dash') === 0; }) ? 'from the dashboard case file'
-        : acts.some(function (a) { return a.authored; }) ? 'from your Next Actions Required note' : 'chase → do it → log it as a WO note';
+      // Phase 1: the card is a MERGE now, so claiming one source for the whole list would
+      // mislabel live generated steps as plan items - the exact confusion the merge exists
+      // to fix. A single source is stated only when every step came from the plan; a mixed
+      // card counts each side, and per-row `why` tags carry the individual sources.
+      var nAuth = 0, nGen = 0;
+      acts.forEach(function (a) { if (a.authored) nAuth++; else if (!a.anchor) nGen++; });
+      var planSrcLbl = acts.some(function (a) { return a.authored && String(a.planRef || '').indexOf('dash') === 0; })
+        ? 'the dashboard case file' : 'your Next Actions Required note';
+      hs.textContent = !nAuth ? 'chase → do it → log it as a WO note'
+        : (nGen ? nAuth + ' from ' + planSrcLbl + ' · ' + nGen + ' from the playbook' : 'from ' + planSrcLbl);
       var hx = document.createElement('span'); hx.className = 'bwn-actc-x'; hx.textContent = collapsed ? '▸' : '▾';
       hd.appendChild(ht); hd.appendChild(hc); hd.appendChild(hs); hd.appendChild(hx);
       function toggleCollapse() {
