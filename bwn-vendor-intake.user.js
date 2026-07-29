@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Vendor Intake (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.8.9
+// @version      0.9.0
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-vendor-intake.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-vendor-intake.user.js
 // @description  Prefills Umbrava's Create Vendor form (and the detail-page Tax ID) from a Prospect Set-Up Form or a W-9. Fillable PDFs are read straight from their form fields; SCANNED W-9s are read by on-device OCR (Tesseract + pdf.js, fetched once at install, run entirely in the browser). The document and its tax ID never leave your machine. Adds a "Prefill from document" button; every extracted field is a suggestion to review before saving - the TIN especially, since OCR can misread digits.
@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VER = '0.8.9';
+  var VER = '0.9.0';
   // v0.4.0 - real IRS fillable W-9 support: map by FIELD NAME (UTF-16BE-decoded f1_/c1_1 names)
   // after inflating compressed object streams, since the IRS form carries no /TU tooltips; the
   // tooltip mapping stays as a fallback for other fillable forms. Also fixed stream inflation to
@@ -468,6 +468,18 @@
     for (var i = 0; i < pages.length; i++) { if (IS_FORM.test(pages[i])) return pages[i]; }
     return pages[0];
   }
+  // A typed value on a form contains letters, digits, and ordinary punctuation. Glyph soup from the
+  // checkbox column and the comb boxes does not - it carries box edges and stray marks. Rejecting on
+  // those characters is what keeps "o | 38" out of DBA and "1 fein) > 4 HA0)\" out of City, both of
+  // which reached the live form from a real Rev-2026 scan.
+  function plausibleValue(v) {
+    var s = String(v || '').trim();
+    if (s.length < 3) return false;
+    if (/[|\\<>~^_={}\[\]*“”]/.test(s)) return false;
+    if (!/[A-Za-z]{2,}|\d{3,}/.test(s)) return false;
+    var junk = (s.match(/[^A-Za-z0-9\s.,'&\-#\/()]/g) || []).length;
+    return junk <= Math.floor(s.length * 0.2);
+  }
   // Pull W-9 fields from OCR (or any) free text. Best-effort + label-anchored; digit-confusion
   // fixups happen inside findTIN. Everything is a SUGGESTION.
   function extractW9FromText(text) {
@@ -479,22 +491,36 @@
     // "(For a sole proprietor or disregarded entity, ... name on line 2.)" instruction into the
     // line-1 label, and its fragments land on their own OCR lines wherever the wrap falls.
     // ^\d+[ab]?$ also swallows the bare "3a"/"3b" item numbers 2024 introduced.
-    var LABEL_NOISE = /required on this line|as shown on|do not leave|this line blank|if different|disregarded entity|name on line \d|owner'?s name|entry is required|sole propriet|check (the )?appropriate|number, street|apt\.?\s*or suite|see instructions|^\d+[ab]?$/i;
+    // Structural headings (Part I/II, the account-number line, the form's own masthead) are labels,
+    // never values - a Rev-2026 scan put "lll Taxpayer Identification Number (TIN) LL" in City.
+    var LABEL_NOISE = /required on this line|as shown on|do not leave|this line blank|if different|disregarded entity|name on line \d|owner'?s name|entry is required|sole propriet|check (the )?appropriate|number, street|apt\.?\s*or suite|see instructions|taxpayer identification number|list account number|^\W*part\s+[i1]{1,3}\b|certification|request for taxpayer|department of the treasury|internal revenue|enter your tin|backup withholding|^\d+[ab]?$/i;
+    // The stop pattern marks where the NEXT label begins, so it is applied PER LINE and the line it
+    // matches is discarded whole. Searching for it as a character offset sliced into the middle of a
+    // line instead: on a real Rev-2026 scan the next label OCR'd as "o | 38 Check the appropriate
+    // box ...", the stop matched at "Check", and the leftover "o | 38" was filled in as the DBA.
     function seg(startRe, stopRe) {
       var m = startRe.exec(raw); if (!m) return '';
       var rest = raw.slice(m.index + m[0].length);
       var nl = rest.indexOf('\n');
       var after = nl >= 0 ? rest.slice(nl + 1) : '';
-      var stop = stopRe ? after.search(stopRe) : -1;
-      var chunk = (stop >= 0 ? after.slice(0, stop) : after);
       // Tesseract puts blank lines between a label block and its typed value, so stopping at a
       // paragraph break loses the value - instead cap the scan at 4 candidate lines.
-      var lines = chunk.split(/\n/).map(function (l) { return l.replace(/^[\s:.\-]+/, '').trim(); }).filter(Boolean).slice(0, 4);
-      for (var i = 0; i < lines.length; i++) { if (!LABEL_NOISE.test(lines[i])) return lines[i]; }
+      var lines = after.split(/\n/), cands = [];
+      for (var i = 0; i < lines.length && cands.length < 4; i++) {
+        var L = lines[i].replace(/^[\s:.\-]+/, '').trim();
+        if (!L) continue;
+        if (stopRe && stopRe.test(L)) break;
+        cands.push(L);
+      }
+      for (var j = 0; j < cands.length; j++) { if (!LABEL_NOISE.test(cands[j]) && plausibleValue(cands[j])) return cands[j]; }
       return '';
     }
     var NEXT = /business name|federal tax|check (the )?appropriate|exempt|address|city,|requester|part i|taxpayer identification|social security|employer identification/i;
-    out.name = seg(/name\s*\(as shown[^)]*\)|^\s*1\s+name\b|name of entity\/individual/im, NEXT);
+    // OCR misreads the label word itself - the Rev-2026 scan rendered line 1 as "1 Nama of
+    // entity/individual", so an anchor requiring the literal "name" matched nothing and Company came
+    // out empty while the value sat legible two lines below. Allow the word to be mangled; the
+    // distinctive part is "of entity/individual", and the leading "1 " keeps it specific.
+    out.name = seg(/name\s*\(as shown[^)]*\)|^\s*1\s+name\b|\bn\w{1,4}\s+of\s+entity\s*[\/|]?\s*individ/im, NEXT);
     // Anchor DBA to the real line-2 label: the 2024 line-1 instruction also contains
     // "business/disregarded entity's name", and a loose match latched onto it.
     out.dba = seg(/^\s*2\s*business name[^\n]*|business name\s*\/\s*disregarded[^\n]*|^\s*2\s*disregarded entity[^\n]*/im, /federal tax|check (the )?appropriate|exempt|address|city,/i);
