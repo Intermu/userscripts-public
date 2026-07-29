@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.9
+// @version      1.66.10
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -44,7 +44,7 @@
   try { localStorage.setItem('bwn:status:core', JSON.stringify({ ver: BWN_VER, ts: Date.now() })); } catch (e) { /* best-effort */ }
 
   console.info('[BWN SUITE CORE] v' + BWN_VER + ' |',
-    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.59 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.16 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
+    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.60 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.16 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
     'enabled:', Object.keys(BWN_MODULES).filter(function (k) { return BWN_MODULES[k]; }).join(', '));
 
   // ===== BWN SHARED CORE v7 - KEEP IN SYNC across both suite scripts =====
@@ -1091,7 +1091,7 @@
   });
 
   // ==========================================================================
-  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.59 (Connector 1.2)
+  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.60 (Connector 1.2)
   // ==========================================================================
   if (BWN_MODULES.woAssist) BWN.safeModule('woAssist', function () {
     'use strict';
@@ -1121,7 +1121,7 @@
     var PANEL_ID = 'bwn-gp-panel';
     var GREEN = BWN.GREEN;
 
-    console.info('[BWN GP] WO Assist v2.59 loaded on', location.href);
+    console.info('[BWN GP] WO Assist v2.60 loaded on', location.href);
 
     // ---- Parsing helpers (shared via BWN core) -----------------------------
     var parseMoney = BWN.parseMoney;
@@ -2183,6 +2183,42 @@
     // Newest note carrying an authored plan. Ranked by Umbrava's monotonic note id
     // (highest = newest) - stable across the deep/cache/view sources and immune to
     // relative-timestamp drift ("1 hour ago"). Never rank or key by the display ts.
+    // Phase 0 plan hysteresis - PURE decision: given the freshly-computed winning plan
+    // (note-vs-dashboard, from readAuthoredPlan), the remembered `_plan` meta from the acts
+    // store, and how the notes were read ('deep'|'cache'|'view'), decide what the checklist
+    // builds from. A candidate OLDER than the remembered plan is accepted only from an
+    // AUTHORITATIVE notes read (deep/cache) - on a partial DOM read ('view') the newer plan
+    // note has likely just not mounted yet, and dethroning it flips labels/convergence back
+    // to a stale source (the check-off-revert repro). While held, the newer plan rebuilds
+    // from the cached _plan items so the card neither flaps nor goes blank; no cache =
+    // degrade to the candidate (pre-Phase-0 behavior). Returns { plan, meta, clear }:
+    // meta = new _plan record to persist (null = leave as is), clear = drop _plan
+    // (authoritative read proved the plan is gone). _plan is underscore-prefixed so it can
+    // never collide with an act key; nothing iterates the store except actsMigrate (regex-
+    // gated), so the meta record is invisible to every act path.
+    function planHysteresis(best, pm, notesSrc) {
+      var authoritative = notesSrc !== 'view';
+      function cacheOf(b, ms) { return { ref: String(b.id || ''), ms: ms, ts: b.ts || null, dash: !!b.dash, items: (b.items || []).slice(0, 40) }; }
+      function rebuild(p) { return { items: (p.items || []).slice(), id: p.ref, ts: p.ts, dash: !!p.dash, when: p.dash ? new Date(p.ms) : undefined, held: true }; }
+      var candMs = null, candRef = '';
+      if (best) {
+        candRef = String(best.id || '');
+        if (best.dash) candMs = best.when ? +best.when : 0;
+        else { try { var pd = BWN.parseNoteDateLoose(best.ts); if (pd) candMs = +pd; } catch (e) { } }
+      }
+      if (!best) {
+        if (!pm) return { plan: null, meta: null, clear: false };
+        if (authoritative) return { plan: null, meta: null, clear: true };
+        return { plan: (pm.items && pm.items.length) ? rebuild(pm) : null, meta: null, clear: false };
+      }
+      var eff = (candMs === null) ? Infinity : candMs;   // undatable NOTE plan = live surface, wins (mirrors the dash winner test)
+      var persistMs = (candMs === null) ? Date.now() : candMs;   // JSON cannot hold Infinity - persist first-seen time
+      if (!pm || candRef === String(pm.ref || '') || eff >= pm.ms) {
+        return { plan: best, meta: cacheOf(best, (pm && candRef === String(pm.ref || '') && candMs === null) ? pm.ms : persistMs), clear: false };
+      }
+      if (authoritative) return { plan: best, meta: cacheOf(best, persistMs), clear: false };   // real rollback (newer note deleted)
+      return { plan: (pm.items && pm.items.length) ? rebuild(pm) : best, meta: null, clear: false };
+    }
     function readAuthoredPlan() {
       var notes = getNotes(), best = null, bestRank = -1;
       for (var i = 0; i < notes.length; i++) {
@@ -2235,7 +2271,15 @@
           }
         }
       } catch (e) { /* bus record optional - Umbrava-only behavior stands */ }
-      return best;
+      // Phase 0 hysteresis: the store write stays HERE in the assembly layer - the pure
+      // engine never touches localStorage. See planHysteresis for the decision table.
+      try {
+        var st = actsLoad();
+        var hz = planHysteresis(best, st._plan || null, lastNotesSrc);
+        if (hz.clear && st._plan) { delete st._plan; actsSave(st); }
+        else if (hz.meta && JSON.stringify(st._plan || null) !== JSON.stringify(hz.meta)) { st._plan = hz.meta; actsSave(st); }
+        return hz.plan;
+      } catch (e) { return best; }
     }
 
     // ---- Role rank (read-only, for tiered escalation wording) ------------------
@@ -2343,8 +2387,15 @@
         else { try { pd = BWN.parseNoteDateLoose(plan.ts); } catch (e) { } }
         var planWhen = pd ? (' (' + (pd.getMonth() + 1) + '/' + pd.getDate() + ')') : '';   // display only - never used in the key
         var planSrc = plan.dash ? 'From the dashboard case file' : 'From the Next Actions Required note';
+        // Phase 0: content-hashed keys - stable across plan-source flaps (the old key
+        // carried plan.id, so a dash->note flip re-keyed every item and orphaned checked
+        // state). Repeated labels disambiguate per-hash (:2, :3...), never by global index;
+        // the plan ref rides as a.planRef for convergence + the header label.
+        var occ = {};
         plan.items.forEach(function (t, i) {
-          acts.push({ key: 'authored:' + (plan.id || '') + ':' + i + ':' + authoredKeyHash(t), label: t, why: planSrc + planWhen, text: null, authored: true, ord: i });
+          var h = authoredKeyHash(t);
+          occ[h] = (occ[h] || 0) + 1;
+          acts.push({ key: 'authored:' + h + (occ[h] > 1 ? ':' + occ[h] : ''), planRef: String(plan.id || ''), label: t, why: planSrc + planWhen, text: null, authored: true, ord: i });
         });
         acts.push({ key: 'anchor:' + (woPhase || 'active'), label: 'Not complete until the WO status is Work Complete, Invoiced, or Paid', why: 'Current status "' + (state.status || '') + '" is not a completion state - advance the WO when the work is truly done', text: null, anchor: true });
         acts.sort(function (x, y) { return scoreAct(y, state) - scoreAct(x, state); });
@@ -2666,7 +2717,35 @@
     // preserved: the note save stays manual, in Umbrava's own composer.
     var ACT_CARD_ID = 'bwn-act-card';
     function actsKey() { var id = currentWOId(); return 'bwn:acts:' + (id || location.pathname); }
-    function actsLoad() { try { var d = JSON.parse(localStorage.getItem(actsKey()) || '{}'); return (d && typeof d === 'object') ? d : {}; } catch (e) { return {}; } }
+    // Phase 0 one-time key migration: authored:<ref>:<i>:<hash> -> authored:<hash>[:<occ>].
+    // Old keys carried the plan ref, so every plan-source flap re-keyed the whole list and
+    // orphaned checked state (the check-off-revert repro). Occurrence numbering is per-hash
+    // among the SAVED entries in (hash, index) order; an existing new-shape record is a
+    // decision and is never overwritten (same rule as autoDetectActioned). Pure: returns
+    // null when nothing to migrate, else the rewritten store object.
+    function actsMigrate(d) {
+      var olds = [], k, m;
+      for (k in d) { m = /^authored:([^:]+):(\d+):([a-z0-9]+)$/.exec(k); if (m) olds.push({ k: k, i: parseInt(m[2], 10), h: m[3] }); }
+      if (!olds.length) return null;
+      olds.sort(function (x, y) { return x.h < y.h ? -1 : x.h > y.h ? 1 : x.i - y.i; });
+      var occ = {};
+      olds.forEach(function (o) {
+        occ[o.h] = (occ[o.h] || 0) + 1;
+        var nk = 'authored:' + o.h + (occ[o.h] > 1 ? ':' + occ[o.h] : '');
+        if (!d[nk]) d[nk] = d[o.k];
+        delete d[o.k];
+      });
+      return d;
+    }
+    function actsLoad() {
+      try {
+        var d = JSON.parse(localStorage.getItem(actsKey()) || '{}');
+        d = (d && typeof d === 'object') ? d : {};
+        var mig = actsMigrate(d);
+        if (mig) { d = mig; actsSave(d); }
+        return d;
+      } catch (e) { return {}; }
+    }
     function actsSave(d) { try { localStorage.setItem(actsKey(), JSON.stringify(d)); } catch (e) { /* best-effort */ } }
 
     function findAddNoteBtn() {
@@ -3164,11 +3243,14 @@
     // Authored items may converge ONLY from notes STRICTLY NEWER than their plan source -
     // every item is a verbatim slice of the plan note, so matching against the plan itself
     // (or anything older) would instantly self-check the whole list (review M1). The plan
-    // ref rides in the key: authored:<umbravaNoteId>:… → newer = higher note id (Umbrava
-    // ids are monotonic); authored:dash<epochMs>:… → newer = a note DATED after the
-    // dashboard case-file save (undated notes never qualify - fail-safe).
+    // ref rides on a.planRef (Phase 0 - formerly parsed from the key, which now carries the
+    // content hash): a note plan's ref is its note id → newer = higher id (Umbrava ids are
+    // monotonic); dash<epochMs> → newer = a note DATED after the dashboard case-file save
+    // (undated notes never qualify - fail-safe). No ref at all → NOTHING converges: a hash
+    // would parseInt to garbage and self-check the whole list.
     function authoredNewerNotes(a, notes) {
-      var ref = ((a.key || '').split(':')[1]) || '', out = [], i;
+      var ref = String((a && a.planRef) || ''), out = [], i;
+      if (!ref) return out;
       if (/^dash\d+$/.test(ref)) {
         // The dash ref carries the plan block's END-OF-DAY epoch, so only LATER-day notes
         // qualify - same-day notes can predate the afternoon the plan was authored (facts
@@ -3336,7 +3418,7 @@
       // so this must NOT imply the job is ready to close (it can be mid-lifecycle).
       hc.textContent = realOpen ? realOpen + ' open' : (open ? 'no open steps' : 'all done ✓');
       var hs = document.createElement('span'); hs.className = 'bwn-actc-s';
-      hs.textContent = acts.some(function (a) { return a.authored && a.key.indexOf('authored:dash') === 0; }) ? 'from the dashboard case file'
+      hs.textContent = acts.some(function (a) { return a.authored && String(a.planRef || '').indexOf('dash') === 0; }) ? 'from the dashboard case file'
         : acts.some(function (a) { return a.authored; }) ? 'from your Next Actions Required note' : 'chase → do it → log it as a WO note';
       var hx = document.createElement('span'); hx.className = 'bwn-actc-x'; hx.textContent = collapsed ? '▸' : '▾';
       hd.appendChild(ht); hd.appendChild(hc); hd.appendChild(hs); hd.appendChild(hx);
