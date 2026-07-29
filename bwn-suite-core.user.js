@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.10
+// @version      1.66.11
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -44,7 +44,7 @@
   try { localStorage.setItem('bwn:status:core', JSON.stringify({ ver: BWN_VER, ts: Date.now() })); } catch (e) { /* best-effort */ }
 
   console.info('[BWN SUITE CORE] v' + BWN_VER + ' |',
-    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.60 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.16 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
+    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.61 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.16 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
     'enabled:', Object.keys(BWN_MODULES).filter(function (k) { return BWN_MODULES[k]; }).join(', '));
 
   // ===== BWN SHARED CORE v7 - KEEP IN SYNC across both suite scripts =====
@@ -1091,7 +1091,7 @@
   });
 
   // ==========================================================================
-  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.60 (Connector 1.2)
+  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.61 (Connector 1.2)
   // ==========================================================================
   if (BWN_MODULES.woAssist) BWN.safeModule('woAssist', function () {
     'use strict';
@@ -1121,7 +1121,7 @@
     var PANEL_ID = 'bwn-gp-panel';
     var GREEN = BWN.GREEN;
 
-    console.info('[BWN GP] WO Assist v2.60 loaded on', location.href);
+    console.info('[BWN GP] WO Assist v2.61 loaded on', location.href);
 
     // ---- Parsing helpers (shared via BWN core) -----------------------------
     var parseMoney = BWN.parseMoney;
@@ -2118,9 +2118,14 @@
     // coordinator habit. Worst-first ordering keeps the hard steps on top; it never
     // hides or de-lists anything.
     function scoreAct(a, state) {
-      // Authored plan items keep their AUTHORED order (the coordinator/AI ordered them
-      // deliberately) - high, descending by index, above every generated step.
-      if (a.authored) return 1000 - (a.ord || 0);
+      // Authored plan items keep their AUTHORED order among themselves (fractional
+      // decrement, stable sort), ranked WITH the generated steps since the Phase 1 merge:
+      // 88 = the human-authored to-do shelf (same as `task`), so live emergencies and hard
+      // gates (noshow 100+, stall 96+, escalate 94, docs 92, intake 90) sort above the
+      // plan, and routine chases (dne 82 base, ecd, po*, phase) sort below it - a
+      // badly-underwater dne or a long-running no-show still climbs past on its boost.
+      // (Pre-Phase-1 this was 1000 - ord: the takeover pin above every generated step.)
+      if (a.authored) return 88 - Math.min(30, a.ord || 0) * 0.01;
       var p = a.key.split(':')[0];
       // Phase 2: docs (missing completion package at closure) sorts just under escalate
       // - closing without the signed ticket/photos is a hard block. intake (unactionable
@@ -2372,12 +2377,15 @@
       // safety net so a future "Cancelled - Duplicate"-type status cannot leak chases).
       if (woPhase === 'terminal' || (!woPhase && /\b(closed|cancell?ed|declined|revoked|void)\b/i.test(state.status || ''))) return acts;
 
-      // AUTHORED PLAN takes over - when the coordinator (or the AI 'Recent Update') has
-      // posted a specific "Next Actions Required" list, show THAT as the checklist instead
-      // of the generic playbook (user request: conform to it + consolidate; no redundant
-      // generic nags on top). Zero-egress - we only READ the note. Items keep their
-      // authored order; the completion anchor is still appended so the list can't read
-      // "all done" until the status is terminal.
+      // AUTHORED PLAN merges into the playbook (Phase 1 - the takeover early-return is
+      // gone). When the coordinator (or the AI 'Recent Update') has posted a specific
+      // "Next Actions Required" list, those items join the generated steps in ONE
+      // worst-first list: live emergencies and hard gates (no-show, stall, escalate,
+      // docs, intake) sort above the plan, routine chases below it (see scoreAct's
+      // authored shelf). Each row keeps its source tag + date in `why` so plan age
+      // stays visible. No dedup between authored and generated items - over-surface
+      // is the safe direction (decided). Zero-egress - we only READ the note. The
+      // completion anchor is appended ONCE by the shared tail below.
       var plan = state.authoredPlan;
       if (plan && plan.items.length) {
         // (The round-trip stage-to-dashboard side effect now lives in the nextActions
@@ -2397,9 +2405,6 @@
           occ[h] = (occ[h] || 0) + 1;
           acts.push({ key: 'authored:' + h + (occ[h] > 1 ? ':' + occ[h] : ''), planRef: String(plan.id || ''), label: t, why: planSrc + planWhen, text: null, authored: true, ord: i });
         });
-        acts.push({ key: 'anchor:' + (woPhase || 'active'), label: 'Not complete until the WO status is Work Complete, Invoiced, or Paid', why: 'Current status "' + (state.status || '') + '" is not a completion state - advance the WO when the work is truly done', text: null, anchor: true });
-        acts.sort(function (x, y) { return scoreAct(y, state) - scoreAct(x, state); });
-        return acts;
       }
 
       // ---- Escalation / ownership ------------------------------------------------
