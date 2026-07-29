@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.12
+// @version      1.66.13
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -44,7 +44,7 @@
   try { localStorage.setItem('bwn:status:core', JSON.stringify({ ver: BWN_VER, ts: Date.now() })); } catch (e) { /* best-effort */ }
 
   console.info('[BWN SUITE CORE] v' + BWN_VER + ' |',
-    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.62 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.16 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
+    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.63 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.16 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
     'enabled:', Object.keys(BWN_MODULES).filter(function (k) { return BWN_MODULES[k]; }).join(', '));
 
   // ===== BWN SHARED CORE v7 - KEEP IN SYNC across both suite scripts =====
@@ -1091,7 +1091,7 @@
   });
 
   // ==========================================================================
-  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.62 (Connector 1.2)
+  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.63 (Connector 1.2)
   // ==========================================================================
   if (BWN_MODULES.woAssist) BWN.safeModule('woAssist', function () {
     'use strict';
@@ -1121,7 +1121,7 @@
     var PANEL_ID = 'bwn-gp-panel';
     var GREEN = BWN.GREEN;
 
-    console.info('[BWN GP] WO Assist v2.62 loaded on', location.href);
+    console.info('[BWN GP] WO Assist v2.63 loaded on', location.href);
 
     // ---- Parsing helpers (shared via BWN core) -----------------------------
     var parseMoney = BWN.parseMoney;
@@ -1951,6 +1951,14 @@
         '.bwn-act-row.nudge{box-shadow:inset 3px 0 0 var(--bwn-bad);padding-left:8px;}' +
         '.bwn-act-dis{font:500 11px ui-monospace,"Segoe UI Mono","SF Mono",monospace;color:var(--bwn-warn);margin-top:3px;}' +
         '.bwn-act-btns{display:flex;flex-direction:column;gap:4px;flex:none;align-items:stretch;}' +
+        '.bwn-act-lbl.nav{cursor:pointer;}' +
+        '.bwn-act-lbl.nav:hover{text-decoration:underline;text-underline-offset:2px;}' +
+        '.bwn-act-lbl.nav:focus-visible{outline:2px solid var(--bwn-accent);outline-offset:2px;border-radius:4px;}' +
+        '.bwn-act-help-t{display:inline-block;margin-left:6px;padding:0;width:15px;height:15px;line-height:14px;vertical-align:1px;border:1px solid var(--bwn-border);border-radius:999px;background:var(--bwn-surface-2);color:var(--bwn-text-faint);font:600 10px ui-monospace,"Segoe UI Mono","SF Mono",monospace;cursor:pointer;flex:none;}' +
+        '.bwn-act-help-t:hover{color:var(--bwn-green);border-color:var(--bwn-green);}' +
+        '.bwn-act-help{margin-top:5px;padding:7px 9px;border-left:2px solid var(--bwn-green);border-radius:0 6px 6px 0;background:var(--bwn-surface-2);font-size:11.5px;line-height:1.45;color:var(--bwn-text-strong);}' +
+        '.bwn-act-help div + div{margin-top:3px;}' +
+        '.bwn-act-flash{outline:2px solid var(--bwn-green)!important;outline-offset:3px;border-radius:6px;}' +
         '.bwn-act-anchor{background:var(--bwn-surface-2);border-bottom:none;border-radius:8px;margin-top:3px;}' +
         '.bwn-act-anchor .bwn-act-lbl{font-style:italic;color:var(--bwn-text-faint);}' +
         '.bwn-act-anchor-mk{flex:none;width:15px;text-align:center;color:var(--bwn-warn);margin-top:1px;font-size:13px;}' +
@@ -3381,6 +3389,107 @@
       if (dirty) actsSave(store);
     }
 
+    // ---- Phase 2 row assist: tool launch, in-page navigation, training -------
+    // Three annotation layers over the SAME acts the pure engine produced. All three are
+    // render-time only - the engine stays side-effect free and its output is unchanged.
+    //
+    // TOOL LAUNCH. A step whose work is done by another suite tool gets a button that
+    // opens that tool's drawer over the existing dock bus. It renders ONLY when the
+    // registrant is currently registered, so a disabled module or a WO the tool does not
+    // apply to yields no button rather than a dead control.
+    // PINNED against the live registrant table (2026-07-28): the dock has exactly four
+    // registrants - dispatch / cc / wo-audit / ask ([[bwn-launcher-dock]]). Only the
+    // dispatch mapping is real today: "Recruit / dispatch a vendor" (phase:schedule, the
+    // Pending Dispatch status) and the intake scoping step are precisely what the Dispatch
+    // drawer does, and the registrant self-gates to Pending Dispatch WOs - so presence
+    // does the status gating for free. Email RFP (bid-out) and AI Draft (suite-ai) are
+    // NOT dock registrants (they answer bwn:cmd only), so their presence cannot be
+    // detected and they are deliberately absent here; wiring them needs a one-line
+    // registration in each of those scripts, which is outside this Core-only phase.
+    var ACT_TOOL = { 'phase:schedule': 'dispatch', 'phase:intake': 'dispatch' };
+    var ACT_TOOL_LABEL = { dispatch: 'Dispatch\u2026', cc: 'CC Request\u2026', 'wo-audit': 'WO Audit\u2026', ask: 'Ask BWN\u2026' };
+    function actTool(a) {
+      if (!a || a.anchor || a.authored) return null;   // authored items are free text - no reliable tool to infer
+      var d = ACT_TOOL[a.key] || ACT_TOOL[(a.key || '').split(':')[0]];
+      return d ? { dock: d } : null;
+    }
+    // Dock presence, WO Assist side. The Launcher module owns dockRoster but lives in its
+    // own IIFE, so this listens to the same bus independently: registrants re-announce on
+    // every host ping (20s), and an entry ages out on the launcher's own TTL. Worst case
+    // after a fresh load is one ping of delay before a button appears - late is fine,
+    // wrong is not.
+    var WA_DOCK_TTL_MS = 65000;   // mirrors the launcher's DOCK_TTL_MS (3 pings + slack)
+    var waDockSeen = {};
+    function waDockAlive(k) { var t = waDockSeen[k]; return !!t && (Date.now() - t) < WA_DOCK_TTL_MS; }
+    document.addEventListener('bwn:evt', function (e) {
+      var d = e && e.detail; if (!d || !d.key) return;
+      if (d.id === 'bwn:dock:register' || d.id === 'bwn:dock:update') waDockSeen[d.key] = Date.now();
+      else if (d.id === 'bwn:dock:unregister') delete waDockSeen[d.key];
+    }, false);
+
+    // IN-PAGE NAVIGATION. Clicking a step label walks the page to the thing it is about.
+    // Only targets with a PROVEN selector are offered (the same ones the engine already
+    // reads): PO rows by their own testid, the ECD picker, the DNE/NTE input. Anything
+    // else returns null so the label stays plain text - a heuristic that silently lands
+    // on the wrong element is worse than no navigation (the NEXT ACTIONS anchor bug).
+    function actNav(a) {
+      if (!a || a.anchor) return null;
+      var parts = (a.key || '').split(':'), p = parts[0];
+      if ((p === 'pomat' || p === 'poacc' || p === 'poconf' || p === 'pocost') && parts[1]) return { kind: 'po', num: parts[1] };
+      if (p === 'ecd') return { kind: 'ecd' };
+      if (p === 'intake' && /\bNTE\b/.test(a.why || '')) return { kind: 'nte' };
+      return null;
+    }
+    function actNavTarget(nav) {
+      if (!nav) return null;
+      if (nav.kind === 'po') return document.querySelector('[data-testid="POAccordion-' + String(nav.num).replace(/["\\]/g, '') + '"]');
+      if (nav.kind === 'ecd') return ecdFieldInput();
+      if (nav.kind === 'nte') return document.querySelector('input[name="doNotExceed"]');
+      return null;
+    }
+    function actNavGo(nav) {
+      var el = actNavTarget(nav);
+      if (!el) return;   // best-effort by contract: a missing target is a silent no-op
+      try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { try { el.scrollIntoView(); } catch (e2) { } }
+      // Outline-only highlight (no layout shift), self-clearing - we are decorating
+      // Umbrava's own element, so it must leave no trace.
+      try {
+        var flash = (el.tagName === 'INPUT' && el.parentNode) ? el.parentNode : el;
+        flash.classList.add('bwn-act-flash');
+        setTimeout(function () { try { flash.classList.remove('bwn-act-flash'); } catch (e3) { } }, 1600);
+      } catch (e4) { }
+    }
+
+    // TRAINING LAYER. Three static lines per step type - what it means, where in Umbrava
+    // to do it, what done looks like - behind a "?" toggle. For a new coordinator the
+    // checklist becomes self-explaining. Deliberately static: zero egress, deterministic,
+    // no AI dependency, nothing to go stale on a network call.
+    var ACT_HELP = {
+      noshow: ['The vendor missed a scheduled visit - the trip is logged but no work happened.', 'Purchase Orders section: open the PO for that vendor and check its scheduled date and status.', 'The vendor confirms a new date in writing and you log it as a WO note.'],
+      stall: ['A vendor has gone quiet past the scheduled visit and chasing has not moved it.', 'Purchase Orders section for the vendor, then the Notes tab for your chase history.', 'Either the vendor commits to a date, or the job is reassigned / escalated.'],
+      escalate: ['This is past what routine chasing fixes - ownership moves up, it is not another chase.', 'Post the escalation as a WO note so it is attributed to you and visible to the next person.', 'The named tier (supervisor / management) has the job and the note records the handoff.'],
+      docs: ['The completion package is missing - a WO should not close without its proof of work.', 'Documents tab on this work order.', 'Signed ticket, sign-in/out, and before/after photos are attached.'],
+      intake: ['The WO is missing fields it needs before it can be scoped, priced, or dispatched.', 'The header fields at the top of this work order (NTE, priority, site, trade).', 'Every required field is filled in, so the job can be assigned cleanly.'],
+      task: ['An Umbrava task on this WO is open or overdue.', 'The Open Tasks block on this work order.', 'The task is completed in Umbrava, not just noted.'],
+      dne: ['Gross profit is under target for this job - the cost side needs a decision.', 'Compare the Client DNE against the PO totals in the Purchase Orders section.', 'Either the cost comes down, the DNE is increased with client approval, or management accepts the write-down.'],
+      ecd: ['The expected completion date is missing or already past.', 'The Expected Completion Date field in the WO header - the "Set ECD..." button proposes one.', 'A realistic date is set and the client has been told.'],
+      pocost: ['A PO is done working but its final cost is not locked yet.', 'Purchase Orders section: open that PO and confirm the final amount.', 'The final cost is confirmed so the WO can move to billing.'],
+      poacc: ['A vendor has not accepted the PO you issued, so nobody is committed to the work.', 'Purchase Orders section: the PO shows Pending Acceptance.', 'The vendor accepts with a scheduled date, or declines so you can reassign.'],
+      pomat: ['Work is waiting on materials for this PO.', 'Purchase Orders section: the PO shows a materials status.', 'You have the supplier, delivery date, and tracking, plus the return-visit date.'],
+      poconf: ['A vendor marked work complete and the completion package needs collecting.', 'Purchase Orders section: the PO shows Confirm Complete.', 'Documents are attached and the PO is confirmed.'],
+      eta: ['There is no credible ETA on record for the next step.', 'Notes tab - look for the last vendor commitment.', 'A specific date from the vendor is logged as a WO note.'],
+      phase: ['The WO status itself is what needs to move - the job is sitting in this state.', 'The status field in the WO header, plus whatever that status is waiting on.', 'The status advances to the next real state.'],
+      clientcad: ['The client has not had an update in longer than this job priority allows.', 'Notes tab: post a Client-typed note (the "Actioned..." button types it for you).', 'A client-facing note is posted, which resets the cadence automatically.'],
+      note: ['This WO has gone quiet - no notes for long enough that nobody can tell what is happening.', 'Notes tab on this work order.', 'Any real note is posted describing the current state.'],
+      authored: ['A step somebody wrote for this job by hand (a Next Actions note, or the dashboard case file).', 'Wherever the item says - it is a written instruction, not a generated step.', 'The item is done and you log it, or you uncheck it if it no longer applies.']
+    };
+    var ACT_HELP_PFX = ['What it means: ', 'Where: ', 'Done when: '];
+    function actHelp(a) {
+      if (!a || a.anchor) return null;   // the anchor explains itself in its own why line
+      return ACT_HELP[a.authored ? 'authored' : (a.key || '').split(':')[0]] || null;
+    }
+    var actHelpOpen = {};   // key -> 1 while its help block is expanded (render state only)
+
     function renderActsInline(state) {
       var card = document.getElementById(ACT_CARD_ID);
       var acts = nextActions(state);
@@ -3403,7 +3512,12 @@
       // the steady-state refresh loop never re-renders the card under the cursor.
       var sig = JSON.stringify([collapsed, acts.map(function (a) {
         var r = store[a.key];
-        return a.key + '|' + a.label + '|' + (r && r.done ? 1 : 0) + '|' + ((r && r.note) || '') + '|' + (a.nudge || 0) + '|' + ((r && r.reason) || '');
+        // Phase 2 additions to the signature: a tool button appearing when its registrant
+        // comes online (or vanishing when it drops) and a help block toggling are both
+        // real content changes - without them the gate would hold a stale card.
+        var tl = actTool(a);
+        return a.key + '|' + a.label + '|' + (r && r.done ? 1 : 0) + '|' + ((r && r.note) || '') + '|' + (a.nudge || 0) + '|' + ((r && r.reason) || '') +
+          '|' + ((tl && waDockAlive(tl.dock)) ? tl.dock : '') + '|' + (actHelpOpen[a.key] ? 1 : 0);
       })]);
       if (card && card.isConnected && card.nextElementSibling === row && card.dataset.sig === sig) return;
       if (card) card.remove();
@@ -3495,8 +3609,41 @@
           var main = document.createElement('div'); main.className = 'bwn-act-main';
           var lbl = document.createElement('div'); lbl.className = 'bwn-act-lbl' + (isDone ? ' done' : '');
           lbl.textContent = a.label;
+          // Phase 2 navigation: the label walks the page to the thing the step is about,
+          // but only where a proven target exists (actNav). Elsewhere it stays plain text.
+          var nav = actNav(a);
+          if (nav) {
+            lbl.className += ' nav';
+            lbl.setAttribute('role', 'button'); lbl.tabIndex = 0;
+            lbl.title = 'Show this on the page';
+            lbl.addEventListener('click', function () { actNavGo(nav); });
+            lbl.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); actNavGo(nav); } });
+          }
+          // Phase 2 training layer: "?" opens three static lines explaining the step.
+          var helpTxt = actHelp(a);
+          if (helpTxt) {
+            var ht = document.createElement('button');
+            ht.type = 'button'; ht.className = 'bwn-act-help-t'; ht.textContent = '?';
+            ht.title = 'What this step means, where to do it, and what done looks like';
+            ht.setAttribute('aria-expanded', actHelpOpen[a.key] ? 'true' : 'false');
+            ht.addEventListener('click', function (ev) {
+              ev.stopPropagation();   // the label may itself be a nav control
+              if (actHelpOpen[a.key]) delete actHelpOpen[a.key]; else actHelpOpen[a.key] = 1;
+              renderActsInline(state);
+            });
+            lbl.appendChild(ht);
+          }
           var why = document.createElement('div'); why.className = 'bwn-act-why'; why.textContent = a.why;
           main.appendChild(lbl); main.appendChild(why);
+          if (helpTxt && actHelpOpen[a.key]) {
+            var hbx = document.createElement('div'); hbx.className = 'bwn-act-help';
+            for (var hi = 0; hi < ACT_HELP_PFX.length; hi++) {
+              var hln = document.createElement('div');
+              hln.textContent = ACT_HELP_PFX[hi] + helpTxt[hi];
+              hbx.appendChild(hln);
+            }
+            main.appendChild(hbx);
+          }
           // A dismissed-with-reason step stays OPEN and shows its logged reason - the
           // dismissal is visible and reversible, never a silent deletion.
           if (!isDone && rec && rec.dismissed && rec.reason) {
@@ -3512,6 +3659,20 @@
             main.appendChild(lg);
           }
           var btns = document.createElement('div'); btns.className = 'bwn-act-btns';
+          // Phase 2 tool launch - rendered only while the owning dock registrant is live,
+          // so this is never a dead control. The click is the same bwn:dock:open the rail
+          // itself emits, so the tool opens exactly as if launched from the dock.
+          var tool = actTool(a);
+          if (tool && waDockAlive(tool.dock) && !isDone) {
+            var tb = document.createElement('button');
+            tb.type = 'button'; tb.className = 'bwn-wa-btn ghost'; tb.textContent = ACT_TOOL_LABEL[tool.dock] || 'Open tool…';
+            tb.style.cssText = 'padding:3px 9px;font-size:10px;';
+            tb.title = 'Open the ' + (ACT_TOOL_LABEL[tool.dock] || 'tool').replace(/…$/, '') + ' drawer for this work order';
+            tb.addEventListener('click', function () {
+              try { document.dispatchEvent(new CustomEvent('bwn:evt', { detail: { id: 'bwn:dock:open', key: tool.dock } })); } catch (e) { }
+            });
+            btns.appendChild(tb);
+          }
           if (a.text) {
             var cp = document.createElement('button');
             cp.type = 'button'; cp.className = 'bwn-wa-btn ghost'; cp.textContent = 'Chase';
