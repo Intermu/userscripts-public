@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Vendor Intake (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.8.6
+// @version      0.8.7
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-vendor-intake.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-vendor-intake.user.js
 // @description  Prefills Umbrava's Create Vendor form (and the detail-page Tax ID) from a Prospect Set-Up Form or a W-9. Fillable PDFs are read straight from their form fields; SCANNED W-9s are read by on-device OCR (Tesseract + pdf.js, fetched once at install, run entirely in the browser). The document and its tax ID never leave your machine. Adds a "Prefill from document" button; every extracted field is a suggestion to review before saving - the TIN especially, since OCR can misread digits.
@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VER = '0.8.6';
+  var VER = '0.8.7';
   // v0.4.0 - real IRS fillable W-9 support: map by FIELD NAME (UTF-16BE-decoded f1_/c1_1 names)
   // after inflating compressed object streams, since the IRS form carries no /TU tooltips; the
   // tooltip mapping stays as a fallback for other fillable forms. Also fixed stream inflation to
@@ -155,17 +155,33 @@
     // cut at the other caption so a probe can never claim digits that sit under the other one,
     // and digit-confusion fixups apply only INSIDE the window - never to the captions themselves.
     // Pipes are box edges first, digit 1s second (two-pass).
+    // Captions are matched at LINE START and EVERY occurrence is probed: Part I's instruction
+    // paragraph ("...generally your social security number (SSN)... your employer identification
+    // number (EIN)...") repeats both phrases MID-LINE and ahead of the real box captions, so a
+    // first-match-only unanchored probe windowed onto prose and read nothing. Line-anchoring also
+    // keeps this off the fillable/tooltip path, whose af.text is one newline-free joined string
+    // (there the 120-char window could otherwise reach past a caption-ish label to a ZIP+4).
     function run9(w) { var r = w.match(/(?<!\d)\d(?:[\s|.,_\/\\-]{0,3}\d){8}(?!\d)/); return r ? r[0].replace(/\D/g, '') : ''; }
+    // An EMPTY comb box is not a TIN: its edges OCR to artifact runs (`| | | |`, `I l I l`) that the
+    // fixups would happily turn into 111111111. So require a real digit in the RAW window before
+    // trusting substitutions, and never accept an all-one-digit result.
     function boxed(capRe, kind) {
-      var m = capRe.exec(s); if (!m) return null;
-      var win = s.slice(m.index + m[0].length, m.index + m[0].length + 120)
-        .split(/social security|employer identification/i)[0]
-        .replace(/[OoQ]/g, '0').replace(/[lI]/g, '1').replace(/S/g, '5').replace(/B/g, '8').replace(/Z/g, '2');
-      var d = run9(win) || run9(win.replace(/\|/g, '1'));
-      if (d.length === 9) return { tin: kind === 'ssn' ? d.slice(0, 3) + '-' + d.slice(3, 5) + '-' + d.slice(5) : d.slice(0, 2) + '-' + d.slice(2), kind: kind };
+      var re = new RegExp(capRe.source, capRe.flags.indexOf('g') >= 0 ? capRe.flags : capRe.flags + 'g');
+      var m;
+      while ((m = re.exec(s)) !== null) {
+        var rawWin = s.slice(m.index + m[0].length, m.index + m[0].length + 120)
+          .split(/social security|employer identification/i)[0];
+        if (!/\d/.test(rawWin)) continue;
+        var win = rawWin
+          .replace(/[OoQ]/g, '0').replace(/[lI]/g, '1').replace(/S/g, '5').replace(/B/g, '8').replace(/Z/g, '2');
+        var d = run9(win) || run9(win.replace(/\|/g, '1'));
+        if (d.length === 9 && !/^(\d)\1{8}$/.test(d)) {
+          return { tin: kind === 'ssn' ? d.slice(0, 3) + '-' + d.slice(3, 5) + '-' + d.slice(5) : d.slice(0, 2) + '-' + d.slice(2), kind: kind };
+        }
+      }
       return null;
     }
-    var r = boxed(/employer identification number/i, 'ein') || boxed(/social security number/i, 'ssn');
+    var r = boxed(/^\s*employer identification number/im, 'ein') || boxed(/^\s*social security number/im, 'ssn');
     if (r) return r;
     var m = s.match(/(?:EIN|employer identification|TIN|tax\s*id)\D{0,12}(\d[\d\s-]{7,}\d)/i);
     if (m) { var d = m[1].replace(/\D/g, ''); if (d.length === 9) return { tin: d.slice(0, 2) + '-' + d.slice(2), kind: 'ein' }; }
