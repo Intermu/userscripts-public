@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Vendor Intake (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.8.7
+// @version      0.8.8
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-vendor-intake.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-vendor-intake.user.js
 // @description  Prefills Umbrava's Create Vendor form (and the detail-page Tax ID) from a Prospect Set-Up Form or a W-9. Fillable PDFs are read straight from their form fields; SCANNED W-9s are read by on-device OCR (Tesseract + pdf.js, fetched once at install, run entirely in the browser). The document and its tax ID never leave your machine. Adds a "Prefill from document" button; every extracted field is a suggestion to review before saving - the TIN especially, since OCR can misread digits.
@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VER = '0.8.7';
+  var VER = '0.8.8';
   // v0.4.0 - real IRS fillable W-9 support: map by FIELD NAME (UTF-16BE-decoded f1_/c1_1 names)
   // after inflating compressed object streams, since the IRS form carries no /TU tooltips; the
   // tooltip mapping stays as a fallback for other fillable forms. Also fixed stream inflation to
@@ -145,9 +145,16 @@
     if (/other/.test(s)) return 'Other';
     return '';
   }
+  // A ZIP+4 is nine digits with a dash in it, exactly like an EIN. It is the one shape that
+  // reliably sits near a caption-looking label on these forms, so it is rejected everywhere.
+  function looksLikeZip4(t) { return /^\s*\d{5}-\d{4}\s*$/.test(String(t || '')); }
   function findTIN(text) {
-    var s = String(text || '');
-    var ein = s.match(/\b(\d{2}-\d{7})\b/); if (ein) return { tin: ein[1], kind: 'ein' };
+    // TIN reading is scoped to the FIRST PAGE. ocrPdf rasterizes up to 2 pages into one string
+    // (separated by \f), and probing all of it let page 2 - a second W-9 in the packet, a parent
+    // company's form, or the instruction sheet - answer for page 1's entity. Page 1 is where the
+    // form being intaken carries its own TIN.
+    var s = String(text || '').split('\f')[0];
+    var ein = s.match(/\b(\d{2}-\d{7})\b/); if (ein && !looksLikeZip4(ein[1])) return { tin: ein[1], kind: 'ein' };
     var ssn = s.match(/\b(\d{3}-\d{2}-\d{4})\b/); if (ssn) return { tin: ssn[1], kind: 'ssn' };
     // Scanned forms: the TIN is written in per-digit comb boxes, so OCR emits digits split by
     // spaces/box artifacts under the caption. Probe a short window AFTER each caption (EIN first:
@@ -155,18 +162,29 @@
     // cut at the other caption so a probe can never claim digits that sit under the other one,
     // and digit-confusion fixups apply only INSIDE the window - never to the captions themselves.
     // Pipes are box edges first, digit 1s second (two-pass).
-    // Captions are matched at LINE START and EVERY occurrence is probed: Part I's instruction
-    // paragraph ("...generally your social security number (SSN)... your employer identification
-    // number (EIN)...") repeats both phrases MID-LINE and ahead of the real box captions, so a
-    // first-match-only unanchored probe windowed onto prose and read nothing. Line-anchoring also
-    // keeps this off the fillable/tooltip path, whose af.text is one newline-free joined string
-    // (there the 120-char window could otherwise reach past a caption-ish label to a ZIP+4).
-    function run9(w) { var r = w.match(/(?<!\d)\d(?:[\s|.,_\/\\-]{0,3}\d){8}(?!\d)/); return r ? r[0].replace(/\D/g, '') : ''; }
+    // EVERY caption occurrence is probed, because Part I's instruction paragraph repeats both
+    // phrases ("...generally your social security number (SSN)... your employer identification
+    // number (EIN)...") ahead of the real box captions and a first-match-only probe read prose.
+    // The caption must open a line - but tesseract prefixes box-edge junk ("| Social security
+    // number") and merges the caption onto the end of a prose line at a sentence break
+    // ("...in the appropriate box. Social security number"), and requiring a bare line start lost
+    // both, which mattered because the fallback below can only ever report an EIN, so a sole
+    // proprietor's SSN vanished. Leading non-alphanumerics and a preceding ". " are allowed; the
+    // prose occurrences are preceded by a WORD ("your "), so they still cannot match.
+    var CAP_OPEN = '(?:^[^A-Za-z0-9\\n]{0,6}|\\.\\s+)\\s*';
+    // Returns the matched run plus where it sat, so the caller can weigh it against the RAW text.
+    function run9(w) {
+      var r = w.match(/(?<!\d)\d(?:[\s|.,_\/\\-]{0,3}\d){8}(?!\d)/);
+      return r ? { digits: r[0].replace(/\D/g, ''), at: r.index, len: r[0].length } : null;
+    }
     // An EMPTY comb box is not a TIN: its edges OCR to artifact runs (`| | | |`, `I l I l`) that the
-    // fixups would happily turn into 111111111. So require a real digit in the RAW window before
-    // trusting substitutions, and never accept an all-one-digit result.
+    // fixups would otherwise turn into a plausible number. Requiring merely SOME digit in the
+    // window was not enough - one stray digit re-armed the substitutions and produced values like
+    // 11-1611191 while a real SSN sat unread above. So weigh the nine characters that actually
+    // formed the run: a majority must have been digits BEFORE any substitution. The substitutions
+    // are all single-character, so indexes into `win` address the same characters in `rawWin`.
     function boxed(capRe, kind) {
-      var re = new RegExp(capRe.source, capRe.flags.indexOf('g') >= 0 ? capRe.flags : capRe.flags + 'g');
+      var re = new RegExp(CAP_OPEN + capRe.source, capRe.flags.indexOf('g') >= 0 ? capRe.flags : capRe.flags + 'g');
       var m;
       while ((m = re.exec(s)) !== null) {
         var rawWin = s.slice(m.index + m[0].length, m.index + m[0].length + 120)
@@ -174,17 +192,21 @@
         if (!/\d/.test(rawWin)) continue;
         var win = rawWin
           .replace(/[OoQ]/g, '0').replace(/[lI]/g, '1').replace(/S/g, '5').replace(/B/g, '8').replace(/Z/g, '2');
-        var d = run9(win) || run9(win.replace(/\|/g, '1'));
-        if (d.length === 9 && !/^(\d)\1{8}$/.test(d)) {
-          return { tin: kind === 'ssn' ? d.slice(0, 3) + '-' + d.slice(3, 5) + '-' + d.slice(5) : d.slice(0, 2) + '-' + d.slice(2), kind: kind };
-        }
+        var hit = run9(win) || run9(win.replace(/\|/g, '1'));
+        if (!hit) continue;
+        var rawRun = rawWin.slice(hit.at, hit.at + hit.len);
+        if (looksLikeZip4(rawRun)) continue;
+        if ((rawRun.match(/\d/g) || []).length < 5) continue;
+        if (/^(\d)\1{8}$/.test(hit.digits)) continue;
+        var d = hit.digits;
+        return { tin: kind === 'ssn' ? d.slice(0, 3) + '-' + d.slice(3, 5) + '-' + d.slice(5) : d.slice(0, 2) + '-' + d.slice(2), kind: kind };
       }
       return null;
     }
-    var r = boxed(/^\s*employer identification number/im, 'ein') || boxed(/^\s*social security number/im, 'ssn');
+    var r = boxed(/employer identification number/im, 'ein') || boxed(/social security number/im, 'ssn');
     if (r) return r;
     var m = s.match(/(?:EIN|employer identification|TIN|tax\s*id)\D{0,12}(\d[\d\s-]{7,}\d)/i);
-    if (m) { var d = m[1].replace(/\D/g, ''); if (d.length === 9) return { tin: d.slice(0, 2) + '-' + d.slice(2), kind: 'ein' }; }
+    if (m && !looksLikeZip4(m[1])) { var d = m[1].replace(/\D/g, ''); if (d.length === 9) return { tin: d.slice(0, 2) + '-' + d.slice(2), kind: 'ein' }; }
     return { tin: '', kind: '' };
   }
   function extractW9(af) {
@@ -405,7 +427,9 @@
     var text = '';
     for (var i = 0; i < canvases.length; i++) {
       var r = await worker.recognize(canvases[i]);
-      text += '\n' + ((r && r.data && r.data.text) || '');
+      // \f marks the page break so findTIN can scope itself to page 1; \n around it keeps every
+      // line-based extractor seeing the same lines it saw before.
+      text += (i ? '\n\f\n' : '\n') + ((r && r.data && r.data.text) || '');
       canvases[i].width = canvases[i].height = 0;   // release the backing store
     }
     return text;
@@ -602,12 +626,30 @@
     return done;   // Type is set (and awaited) by the caller, so a slow/failed Type can't stop it
   }
 
+  // These watchers hold one vendor's data in a closure for 5 minutes and then fill the first
+  // matching field that appears ANYWHERE in the document. That is fine while the operator stays in
+  // the modal they dropped the file into, and wrong the moment they abandon it and start a
+  // different vendor inside the 5 minutes - the next Billing step would receive the previous
+  // vendor's Tax ID, on a single-page app where no reload clears the watcher. So each armed
+  // watcher records the modal it belongs to and the drop that armed it, and stands down if either
+  // is stale. Standing down means the field is left EMPTY for the operator to type, which is the
+  // safe direction; filling another party's tax ID is not.
+  var _flowSeq = 0;
+  function armFlow() { return { seq: ++_flowSeq, owner: document.querySelector('.MuiDialog-container, [role="dialog"]') }; }
+  function flowStale(flow) {
+    if (flow.seq !== _flowSeq) return true;                              // a newer document was dropped
+    return !!(flow.owner && !flow.owner.isConnected);                    // that modal is gone
+  }
   // Step 2 (Address) renders after Next. Watch for its fields, then fill ONCE they appear.
-  function watchStep2(addr) {
+  // One drop can arm both watchers, so the flow is armed ONCE by the caller and shared - arming it
+  // per watcher would make the first watcher stale the instant the second one armed.
+  function watchStep2(addr, flow) {
     if (!addr.street && !addr.city && !addr.zip) return;
+    flow = flow || armFlow();
     var filled = false;
     var obs = new MutationObserver(function () {
       if (filled) return;
+      if (flowStale(flow)) { obs.disconnect(); return; }
       var root = document.querySelector('.MuiDialog-container, [role="dialog"]');
       if (!root || !fieldByLabel(root, /^Street/)) return;
       filled = true; obs.disconnect();
@@ -656,11 +698,13 @@
 
   // Watch for the Create-flow Billing step (step 3) and fill its Tax ID once. Separate from
   // watchStep2 (address). The TIN is filled straight in and never logged/toasted as a value.
-  function watchBillingStep(tin) {
+  function watchBillingStep(tin, flow) {
     if (!tin) return;
+    flow = flow || armFlow();
     var filled = false;
     var obs = new MutationObserver(function () {
       if (filled) return;
+      if (flowStale(flow)) { obs.disconnect(); return; }
       var el = document.querySelector('input[name="billing.taxId"]');
       if (!el) return;
       filled = true; obs.disconnect();
@@ -703,8 +747,9 @@
     if (w9.dba) { var d = q('details.doingBusinessAs'); if (d) { setNativeValue(d, w9.dba); done.push('DBA'); } }
     if (w9.entity) { var e = root.querySelector('select[name="details.entity"]'); if (e) { setNativeValue(e, w9.entity); done.push('Entity'); } }
     surfaceDup(root);
-    if (w9.street || w9.city || w9.zip) watchStep2({ street: w9.street, city: w9.city, state: w9.state, zip: w9.zip });
-    if (w9.tin) watchBillingStep(w9.tin);   // Billing step, step 3
+    var flow = armFlow();   // one flow for this drop; both watchers stand down together
+    if (w9.street || w9.city || w9.zip) watchStep2({ street: w9.street, city: w9.city, state: w9.state, zip: w9.zip }, flow);
+    if (w9.tin) watchBillingStep(w9.tin, flow);   // Billing step, step 3
     var notes = ['From W-9:'];
     if (done.length) notes.push('filled ' + done.join(', '));
     if (w9.street) notes.push('address on step 2');
