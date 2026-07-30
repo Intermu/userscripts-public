@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN WO Audit (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.6.1
+// @version      0.7.0
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-wo-audit.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-wo-audit.user.js
 // @description  Batch WO-audit tool. Upload a WO audit .xlsx; for each work order this reads its two most recent notes DIRECTLY from Umbrava's GraphQL API in-page (using your live Umbrava session - the same read the BWN Ops Suite AI drafts use), then asks the broadway-internal-ops SWA summarize route (x-bwn-key gated, Anthropic key server-side) to write a 1-3 sentence client-ready status note. Fills the audit's notes column and downloads the workbook, preserving every other cell and formula. Runs entirely in the app.umbrava.com page so it inherits your Umbrava auth - no MCP, no pasted keys, nothing sensitive in this script. This replaces the old standalone WO_Audit_Automation.html SWA tool, whose server-side MCP path could not authenticate to Umbrava.
@@ -19,7 +19,7 @@
 (function () {
   'use strict';
 
-  var VER = '0.6.0';
+  var VER = '0.7.0';
   var FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Arial,sans-serif";
   var SWA_BASE = 'https://green-stone-0717dab0f.7.azurestaticapps.net';
   var GREEN = '#0d3d26';
@@ -116,7 +116,7 @@
       try {
         GM_xmlhttpRequest({
           method: 'POST', url: url, headers: headers, data: JSON.stringify(bodyObj), timeout: timeoutMs || 60000,
-          onload: function (r) { var j = null; try { j = JSON.parse(r.responseText); } catch (e) { } resolve({ status: r.status, json: j }); },
+          onload: function (r) { var j = null; try { j = JSON.parse(r.responseText); } catch (e) { } resolve({ status: r.status, json: j, headers: r.responseHeaders || '' }); },
           onerror: function () { reject(new Error('network error')); },
           ontimeout: function () { reject(new Error('timed out')); },
         });
@@ -347,14 +347,68 @@
     ].join('\n');
   }
 
+  // Parse `retry-after` out of GM_xmlhttpRequest's raw CRLF header blob. Accepts either form
+  // RFC 9110 allows (delay-seconds or an HTTP-date). Returns 0 when absent or unparseable so
+  // callers fall back to their own table; clamped to 120s so a wild value cannot park a row.
+  function retryAfterMs(rawHeaders) {
+    var m = /^[ \t]*retry-after[ \t]*:[ \t]*(.+)$/im.exec(String(rawHeaders || ''));
+    if (!m) return 0;
+    var v = m[1].trim();
+    var secs = /^\d+$/.test(v) ? parseInt(v, 10) : NaN;
+    if (isNaN(secs)) {
+      var when = Date.parse(v);
+      if (isNaN(when)) return 0;
+      secs = Math.ceil((when - Date.now()) / 1000);
+    }
+    if (!(secs > 0)) return 0;
+    return Math.min(secs, 120) * 1000;
+  }
+
+  // Timing budget. These MUST fit inside the timeoutMs handed to bwnAI at the call site: the
+  // BYTE-FROZEN router wraps the whole run in withTimeout(run, timeoutMs) and resolves '' when
+  // it wins, which discards the recorded reason and falls through to the generic message. The
+  // sender therefore gets the SHORTER deadline and always reports first; the router is only a
+  // backstop. Getting this wrong is what made a 15s+45s schedule inside a 60s router budget a
+  // guaranteed row failure that merely took a minute longer to arrive.
+  var AI_ATTEMPT_TIMEOUT_MS = 45000;                          // one wire attempt
+  var AI_ROW_BUDGET_MS = 150000;                              // attempt + a full 60s wait + attempt
+  var AI_ROUTER_TIMEOUT_MS = AI_ROW_BUDGET_MS + 15000;        // backstop, never the reporter
+  var THROTTLE_BACKOFF_MS = [15000, 45000];   // cumulative 60s - clears either 60s window
+  var TRANSIENT_BACKOFF_MS = [2000, 6000];    // plain 5xx / network blip
+
+  // Plain-language cause for a coordinator, wire detail kept in parentheses for support.
+  // "HTTP 502: Anthropic API error (429)" tells the reader nothing they can act on.
+  function causeText(kind, status, detail) {
+    var head = (kind === 'throttle') ? 'the AI service was busy, rate limited'
+      : (kind === 'timeout') ? 'the AI service did not respond in time'
+      : (kind === 'auth') ? 'the SWA rejected the ingest key'
+      : (kind === 'budget') ? 'gave up waiting out a rate limit'
+      : 'the AI service errored';
+    var tail = [];
+    if (status) tail.push('HTTP ' + status);
+    if (detail) tail.push(String(detail));
+    return head + (tail.length ? ' (' + tail.join(': ') + ')' : '');
+  }
+
+  // An upstream Anthropic throttle reaches us as a GENERIC 502 whose body names the real
+  // status, so testing status === 429 alone misses it and drops to the fast transient table -
+  // reintroducing the very bug this schedule exists to fix.
+  function isThrottle(r) {
+    if (r.status === 429 || r.status === 529) return true;
+    var e = (r.json && r.json.error) ? String(r.json.error) : '';
+    return r.status === 502 && /\((?:429|529)\)/.test(e);
+  }
+
   // Injected proxy sender: ONE POST to /api/ai (summarize tier). Reuses the existing
-  // ingest-key + Umbrava-token plumbing. Keeps the old per-WO transient-retry policy
-  // (429/5xx/network, 3 tries, backoff) so batch retry behavior is unchanged. Resolves
-  // '' on any miss so bwnAI falls through and never throws (backgrounded-tab rule).
-  function aiProxySend(payload) {
+  // ingest-key + Umbrava-token plumbing. Resolves '' on any miss so bwnAI falls through and
+  // never throws (backgrounded-tab rule), recording WHY into `ctx.reason` - including a
+  // PROVISIONAL reason before each wire call, so a row abandoned mid-flight still reports
+  // something truthful rather than the generic rank/key fallback.
+  function aiProxySend(payload, ctx) {
     payload = payload || {};
+    ctx = ctx || {};
     var key = getKey();
-    if (!key) return Promise.resolve('');
+    if (!key) { ctx.reason = causeText('auth', 0, 'no ingest key set; use the Tampermonkey menu'); return Promise.resolve(''); }
     var body = {
       task: payload.task || 'summarize',
       input: (payload.prompt != null) ? String(payload.prompt) : '',
@@ -363,16 +417,58 @@
     if (payload.system) body.system = payload.system;
     if (payload.model) body.model = payload.model;
     var tries = 3, attempt = 0;
+    var deadline = Date.now() + AI_ROW_BUDGET_MS;
+    var lastKind = '', lastStatus = 0;   // what we most recently SAW, for the budget message
+    var sawThrottle = false;             // sticky: a row throttled twice then timing out is,
+                                         // in substance, rate limited - say so or the reader
+                                         // chases the wrong cause on the last attempt's class.
+    function give(why) {
+      var msg = why + (attempt > 1 ? ' after ' + attempt + ' tries' : '');
+      if (sawThrottle && !/rate limited/.test(msg)) msg += '; the service was rate limiting this batch earlier';
+      ctx.reason = msg;
+      return '';
+    }
+    // When the budget is the binding constraint, name what we were up against - "ran out of
+    // time" alone would send a coordinator chasing the wrong thing, which is the whole bug.
+    function giveBudget() {
+      var head = lastKind ? causeText(lastKind, lastStatus, '') : 'the AI service did not respond';
+      return give(head + ', and the ' + Math.round(AI_ROW_BUDGET_MS / 1000) + 's limit for one row ran out');
+    }
+    // Never sleep past the budget, and never issue a POST after it: sleeping into the router
+    // abort is what discarded the reason, and a late POST spends the shared IP throttle on a
+    // row that has already been marked errored.
+    function pause(waitMs, throttled, hadHeader) {
+      if (Date.now() + waitMs >= deadline) return Promise.resolve(giveBudget());
+      if (ctx.onWait) { try { ctx.onWait(waitMs, throttled, hadHeader); } catch (e) { } }
+      return sleep(waitMs).then(once);
+    }
     function once() {
       attempt++;
-      return gmPost(AI_URL, { 'Content-Type': 'application/json', 'x-bwn-key': key }, body, 60000)
+      // Cap this attempt to what is left. An attempt that STARTS inside the budget can still
+      // run past it - and past the router backstop - which is exactly how a reason gets lost.
+      var remain = deadline - Date.now();
+      if (remain <= 1000) return Promise.resolve(giveBudget());
+      ctx.reason = causeText('timeout', 0, 'no reply yet on try ' + attempt);
+      return gmPost(AI_URL, { 'Content-Type': 'application/json', 'x-bwn-key': key }, body, Math.min(AI_ATTEMPT_TIMEOUT_MS, remain))
         .then(function (r) {
           if (r.status >= 200 && r.status < 300 && r.json && r.json.ok && r.json.status === 'final') return String(r.json.text || '');
-          if ((r.status === 429 || r.status >= 500 || r.status === 0) && attempt < tries) return sleep(600 * attempt).then(once);
-          return '';
-        }, function () {
-          if (attempt < tries) return sleep(600 * attempt).then(once);
-          return '';
+          var throttled = isThrottle(r);
+          var detail = (r.json && r.json.error) ? String(r.json.error) : '';
+          lastKind = throttled ? 'throttle' : (r.status === 403 ? 'auth' : 'error');
+          lastStatus = r.status;
+          if (throttled) sawThrottle = true;
+          // 403/400/413 are verdicts, not weather - retrying them only wastes the budget.
+          if (r.status === 403 || r.status === 400 || r.status === 413) return give(causeText(lastKind, r.status, detail));
+          if (attempt >= tries) return give(causeText(lastKind, r.status, detail));
+          var hinted = retryAfterMs(r.headers);
+          var table = throttled ? THROTTLE_BACKOFF_MS : TRANSIENT_BACKOFF_MS;
+          return pause(hinted || table[attempt - 1] || table[table.length - 1], throttled, hinted > 0);
+        }, function (e) {
+          var why = (e && e.message) || 'network error';
+          lastKind = /timed out/i.test(why) ? 'timeout' : 'error';
+          lastStatus = 0;
+          if (attempt >= tries) return give(causeText(lastKind, 0, why));
+          return pause(TRANSIENT_BACKOFF_MS[attempt - 1] || TRANSIENT_BACKOFF_MS[TRANSIENT_BACKOFF_MS.length - 1], false, false);
         });
     }
     return once();
@@ -383,7 +479,11 @@
   // (minRank 1) forces the /api/ai summarize call for any staff+ with a known role; the
   // server is key-only, so the client rank read is UX-only. A miss (connector down / role
   // not yet resolved) throws so the batch pool marks the row for "Retry Errors" (unchanged).
-  function summarize(woFacts, notes, model) {
+  function summarize(woFacts, notes, model, onWait) {
+    // Per-WO context, not module state: concurrency defaults to 3, so a shared object would
+    // cross-report one row's reason onto another. `onWait` lets the batch log a liveness line
+    // while the sender sits in backoff.
+    var ctx = { onWait: onWait };
     return bwnAI({
       task: 'summarize',
       tier: 'proxy',
@@ -392,22 +492,29 @@
       system: WO_AUDIT_SYSTEM,
       oneLine: false,
       maxChars: 4000,
-      timeoutMs: 60000,
+      timeoutMs: AI_ROUTER_TIMEOUT_MS,
       fallback: [],
-      proxySend: function (p) { p.model = model; return aiProxySend(p); }
+      proxySend: function (p) { p.model = model; return aiProxySend(p, ctx); }
     }).then(function (note) {
       note = String(note || '').trim();
-      if (!note) throw new Error('AI summarize unavailable - check the SWA ingest key and that your Umbrava role has resolved, then Retry Errors');
+      // ctx.reason is set before the first wire call, so an unset reason now means bwnAI never
+      // reached the sender AT ALL - the router fail-closed on an unknown Umbrava rank
+      // (`bwn:role:last` unpublished, i.e. running without the Ops Suite). That is the only
+      // case the key/role hint ever described, and the run summary states it once.
+      if (!note) throw new Error(ctx.reason || 'Umbrava rank not resolved - run alongside the BWN Ops Suite');
       return note;
     });
   }
 
   // ---- Bounded-concurrency runner ----
-  function runPool(items, worker, concurrency, onProgress) {
+  function runPool(items, worker, concurrency, onProgress, shouldStop) {
     return new Promise(function (resolve) {
       var i = 0, done = 0, results = new Array(items.length);
       function next() {
         if (i >= items.length) return Promise.resolve();
+        // Cancel stops handing out NEW rows; rows already in flight finish so their notes are
+        // not lost. Backoff waits can run to minutes, so a batch must be interruptible.
+        if (shouldStop && shouldStop()) return Promise.resolve();
         var idx = i++;
         return Promise.resolve().then(function () { return worker(items[idx], idx); })
           .then(function (v) { results[idx] = v; }, function (e) { results[idx] = { error: (e && e.message) || String(e) }; })
@@ -494,6 +601,10 @@
   // UI
   // ====================================================================
   var session = null;   // { wb, ws, map, rows:[{rowIdx, key}], results:[], name }
+  // Module scope so the dock-eviction listener can see it too. A run can now span many minutes
+  // of rate-limit backoff, so dismissing the drawer mid-run has to stop being a silent way to
+  // throw away every note already written into the workbook.
+  var _running = false, _cancelled = false;
 
   function toast(msg) {
     var t = document.createElement('div');
@@ -529,6 +640,7 @@
       '</div>' +
       '<div style="display:flex;gap:10px;align-items:center;margin:12px 0">' +
       '<button id="bwn-woaudit-start" style="background:' + GREEN + ';color:#fff;border:0;padding:9px 18px;border-radius:8px;font-weight:600;cursor:pointer">Start Audit</button>' +
+      '<button id="bwn-woaudit-cancel" style="display:none;background:#6b1d1d;color:#fff;border:0;padding:9px 14px;border-radius:8px;font-weight:600;cursor:pointer">Cancel</button>' +
       '<button id="bwn-woaudit-retry" style="display:none;background:#8a4b00;color:#fff;border:0;padding:9px 14px;border-radius:8px;font-weight:600;cursor:pointer">Retry Errors</button>' +
       '<button id="bwn-woaudit-dl" style="display:none;background:#1a5f3e;color:#fff;border:0;padding:9px 14px;border-radius:8px;font-weight:600;cursor:pointer">Download .xlsx</button>' +
       '</div>' +
@@ -539,8 +651,14 @@
     document.body.appendChild(ov);
 
     var $ = function (id) { return document.getElementById(id); };
-    ov.addEventListener('click', function (e) { if (e.target === ov) ov.remove(); });
-    $('bwn-woaudit-x').onclick = function () { ov.remove(); };
+    // Dismissal is refused while a run is in flight - a stray backdrop click during a long
+    // backoff would otherwise orphan the workbook in memory with no route to Download.
+    function tryClose() {
+      if (_running) { logln('  (still running - press Cancel first if you want to stop)'); return; }
+      ov.remove();
+    }
+    ov.addEventListener('click', function (e) { if (e.target === ov) tryClose(); });
+    $('bwn-woaudit-x').onclick = tryClose;
 
     var msel = $('bwn-woaudit-model');
     MODELS.forEach(function (m) { var o = document.createElement('option'); o.value = m.id; o.textContent = m.label; msel.appendChild(o); });
@@ -603,6 +721,14 @@
     $('bwn-woaudit-start').onclick = function () { runAudit(false); };
     $('bwn-woaudit-retry').onclick = function () { runAudit(true); };
     $('bwn-woaudit-dl').onclick = function () { downloadResult(); };
+    // Stops handing out new rows; in-flight rows finish so their notes are kept and Download
+    // still appears. Without this the only exit from a long backoff is reloading the tab.
+    $('bwn-woaudit-cancel').onclick = function () {
+      if (!_running || _cancelled) return;
+      _cancelled = true;
+      logln('Cancelling - letting the rows already in flight finish...');
+      this.disabled = true;
+    };
 
     function runAudit(retryOnly) {
       if (!session) return;
@@ -623,12 +749,26 @@
       if (retryOnly && !targets.length) { logln('No errored rows to retry.'); return; }
 
       $('bwn-woaudit-start').disabled = true; $('bwn-woaudit-retry').style.display = 'none'; $('bwn-woaudit-dl').style.display = 'none';
+      $('bwn-woaudit-cancel').style.display = 'inline-block';
+      $('bwn-woaudit-cancel').disabled = false;
+      _running = true; _cancelled = false;
       if (!retryOnly) { log.textContent = ''; session.results = new Array(session.rows.length); }
       logln((retryOnly ? 'Retrying ' : 'Auditing ') + targets.length + ' work orders with ' + model + ' (concurrency ' + conc + ')...');
       var prog = $('bwn-woaudit-prog');
+      // Seed it: onProgress only fires when a row SETTLES, and a throttled row can now sit in
+      // backoff for over a minute. A blank progress area plus a silent log reads as a hang.
+      prog.textContent = 'Progress: 0 / ' + targets.length;
 
       runPool(targets, function (row) {
         var origIdx = session.rows.indexOf(row);
+        // Liveness while the sender waits out a throttle. `hadHeader` is deliberately surfaced:
+        // this is the first use of GM_xmlhttpRequest responseHeaders anywhere in the suite, so
+        // the first live throttle tells us whether the retry-after plumbing actually works.
+        var onWait = function (ms, throttled, hadHeader) {
+          logln('  . WO ' + row.key + ': ' + (throttled ? 'AI service busy' : 'retrying') +
+            ', waiting ' + Math.round(ms / 1000) + 's' +
+            (throttled ? (hadHeader ? ' (server retry-after)' : ' (no retry-after header)') : ''));
+        };
         return woNotes(row.key)
           .then(function (data) {
             var woFacts = {
@@ -642,7 +782,7 @@
               assignedTo: cellStr(session.map.aoa, row.rowIdx, session.map.assigned),
             };
             var top2 = data.notes.slice(0, 2);
-            return summarize(woFacts, top2, model).then(function (note) {
+            return summarize(woFacts, top2, model, onWait).then(function (note) {
               return { note: note, notesFound: data.notes.length };
             });
           })
@@ -658,14 +798,27 @@
             logln('  ! WO ' + row.key + ': ' + session.results[origIdx].error);
             throw e;   // marks the pool slot as errored too
           });
-      }, conc, function (done, total) { prog.textContent = 'Progress: ' + done + ' / ' + total; })
+      }, conc, function (done, total) { prog.textContent = 'Progress: ' + done + ' / ' + total; },
+        function () { return _cancelled; })
         .then(function () {
+          _running = false;
           var errs = session.results.filter(function (r) { return r && r.error; }).length;
           var ok = session.results.filter(function (r) { return r && !r.error; }).length;
-          logln('Done. ' + ok + ' written, ' + errs + ' errored.');
-          $('bwn-woaudit-start').disabled = false;
-          $('bwn-woaudit-dl').style.display = 'inline-block';
-          if (errs) { $('bwn-woaudit-retry').style.display = 'inline-block'; }
+          logln((_cancelled ? 'Cancelled. ' : 'Done. ') + ok + ' written, ' + errs + ' errored.');
+          // Guidance belongs HERE, once, not appended to every failing row: mid-run a reader
+          // cannot evaluate "if every row failed", and 40 copies scroll the results out of the
+          // 240px log box. This line is the actual decision point.
+          if (errs && !ok) {
+            logln('EVERY row failed. Check the SWA ingest key (Tampermonkey menu) and that you are signed into Umbrava with a resolved role - run the BWN Ops Suite alongside this.');
+          } else if (errs) {
+            logln('Some rows failed. The causes are listed above; rate limits clear on their own, so Retry Errors usually finishes them.');
+          }
+          // Null-safe: the drawer can be gone if it was dismissed before the guard existed, or
+          // rebuilt mid-run. Losing the buttons must not kill the results.
+          var sb = $('bwn-woaudit-start'); if (sb) sb.disabled = false;
+          var cb = $('bwn-woaudit-cancel'); if (cb) cb.style.display = 'none';
+          var db = $('bwn-woaudit-dl'); if (db) db.style.display = 'inline-block';
+          if (errs) { var rb = $('bwn-woaudit-retry'); if (rb) rb.style.display = 'inline-block'; }
         });
     }
 
@@ -715,8 +868,9 @@
         dockRegister();
       }
       if (d.id === 'bwn:dock:open' && d.key === DOCK_KEY) buildModal();
-      // Another tool took the drawer slot - close ours.
-      if (d.id === 'bwn:drawer:open' && d.key !== DOCK_KEY) {
+      // Another tool took the drawer slot - close ours, UNLESS a batch is in flight (a run can
+      // span minutes of rate-limit backoff, and evicting it would discard the written rows).
+      if (d.id === 'bwn:drawer:open' && d.key !== DOCK_KEY && !_running) {
         var o = document.getElementById('bwn-woaudit-ov'); if (o) o.remove();
       }
     });
