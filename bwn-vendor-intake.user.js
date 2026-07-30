@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Vendor Intake (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.9.0
+// @version      0.9.2
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-vendor-intake.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-vendor-intake.user.js
 // @description  Prefills Umbrava's Create Vendor form (and the detail-page Tax ID) from a Prospect Set-Up Form or a W-9. Fillable PDFs are read straight from their form fields; SCANNED W-9s are read by on-device OCR (Tesseract + pdf.js, fetched once at install, run entirely in the browser). The document and its tax ID never leave your machine. Adds a "Prefill from document" button; every extracted field is a suggestion to review before saving - the TIN especially, since OCR can misread digits.
@@ -21,7 +21,7 @@
 (function () {
   'use strict';
 
-  var VER = '0.9.0';
+  var VER = '0.9.2';
   // v0.4.0 - real IRS fillable W-9 support: map by FIELD NAME (UTF-16BE-decoded f1_/c1_1 names)
   // after inflating compressed object streams, since the IRS form carries no /TU tooltips; the
   // tooltip mapping stays as a fallback for other fillable forms. Also fixed stream inflation to
@@ -151,7 +151,10 @@
   // and testing only the pristine dash let `O7081-1234` / `07081 1234` / `07081.1234` through. The
   // single-separator requirement is what keeps a real TIN out of this net: `123456789` has no
   // separator and a comb-box run (`1 2 3 4 5 6 7 8 9`) has one between every digit.
-  function looksLikeZip4(t) { return /^\d{5}[\s.\-_]{1,3}\d{4}$/.test(String(t || '').trim()); }
+  // Separator class matches the comb scan's own: OCR also emits `|`, `,`, `/` and `\` for that
+  // hyphen, and testing a narrower set let `07081|1234` and `07081,1234` through (5th recurrence
+  // of the same gap). Callers must skip this test for comb-spaced runs - see combSpaced().
+  function looksLikeZip4(t) { return /^\d{5}[\s|.,_\/\\-]{1,3}\d{4}$/.test(String(t || '').trim()); }
   // The box GROUPING a form prints is the only in-text evidence of which kind a comb run is: an
   // SSN comb is grouped 3-2-4 and an EIN comb 2-7. Anything else (notably per-box spacing, where
   // every digit is separated alike) carries no grouping signal at all.
@@ -169,38 +172,117 @@
     if (kind === 'ein') return d.slice(0, 2) + '-' + d.slice(2);
     return d;
   }
+  // ===== TIN REGION =========================================================
+  // Where on the page a Tax ID is ALLOWED to be. Measured against the real IRS Form W-9
+  // (Rev. March 2024), not assumed - see wiki/w9-part-i-caption-anchor.md for the offsets.
+  //
+  // 0.8.9 dropped caption anchoring when it moved to reading runs first, and 0.9.0 shipped that:
+  // every strategy searched the WHOLE page and took the first hit, so a number the VENDOR controls
+  // outranked the real comb. `12 3456789` typed into line 7 ("List account number(s) here") wins,
+  // and a routing number printed above Part I becomes the recorded Tax ID - silently, because the
+  // toast never prints the value.
+  //
+  // The obvious repair, anchoring on the first occurrence of a caption phrase, fails TWICE:
+  //   - the phrase is text a vendor can print on their own document, so the window moves to them
+  //   - on the real form both phrases occur FIRST inside Part I's instruction prose ("this is
+  //     generally your social security number (SSN)... it is your employer identification number
+  //     (EIN)"), 451 chars above the real label, so the window closes before the comb
+  // Both are closed by anchoring on STRUCTURE the form owns rather than on a phrase.
+  var SSN_CAP = 'social security number', EIN_CAP = 'employer identification number';
+  var PART_I_RE = /^[^\S\n]*part\s+i\b[^\n]*/gim;
+  var PART_II_RE = /^[^\S\n]*part\s+ii\b[^\n]*/gim;
+  // A caption acting as a BOX LABEL owns its whole line. The prose mentions are mid-sentence, so
+  // this one test separates them without needing to know where either sits.
+  var CAP_LINE_RE = /^[^\S\n]*(?:social security number|employer identification number)[^\S\n]*$/gim;
+  function allMatches(s, re) {
+    var out = [], m;
+    re.lastIndex = 0;
+    while ((m = re.exec(s)) !== null) { out.push(m.index); if (m.index === re.lastIndex) re.lastIndex++; }
+    return out;
+  }
+  function tinRegion(s) {
+    var t = String(s || '');
+    // Exactly one heading of each. A genuine W-9 page has one Part I and one Part II; anything
+    // else is either an unscoped multi-form packet or a page where someone printed the heading to
+    // move the window, and both deserve a refusal rather than a guess.
+    var p1 = allMatches(t, PART_I_RE), p2 = allMatches(t, PART_II_RE);
+    if (p1.length !== 1 || p2.length !== 1) return null;
+    var floor = p1[0], hi = p2[0];
+    if (!(hi > floor)) return null;
+    var caps = allMatches(t, CAP_LINE_RE).filter(function (o) { return o > floor && o < hi; });
+    if (!caps.length) return null;
+    // A genuine Part I carries exactly two comb labels, one above each stacked comb row. A third
+    // means someone
+    // printed a caption line of their own inside the block to drag the floor up above their own
+    // number - the only remaining way to aim this, once the region is bounded by the headings.
+    // Refuse rather than pick, because picking is what the whole class of bug is made of.
+    if (caps.length > 2) return null;
+    // FIRST caption inside the block, not last. This is geometry, not a guess about text order:
+    // the SSN comb (y=396..420) physically sits ABOVE the EIN caption (y=377), so anchoring on the
+    // last caption starts below the SSN box and silently blanks the Tax ID for every sole
+    // proprietor - the same population 0.8.8's comb mis-grouping hit. Ceiling is Part II, so no
+    // character-count window is involved at all.
+    return { lo: Math.min.apply(null, caps), hi: hi };
+  }
+  // ===== END TIN REGION =====================================================
+
   // Find the TIN in already-page-scoped text (the caller picks the page; see pickFormPage).
   //
   // This reads RUNS FIRST and attributes them afterwards, rather than windowing after each caption.
-  // Caption-first windowing cannot work on the real form: the SSN and EIN combs sit SIDE BY SIDE, so
-  // tesseract prints both captions and THEN the single row of boxes -
+  // Caption-first windowing produced text in which both captions arrive before a single digit row -
   //     Social security number / or / Employer identification number / 9 8 7 6 5 4 3 2 1
-  // which made the EIN window claim a sole proprietor's SSN and report 987-65-4321 as 98-7654321,
-  // while the SSN window could only ever see the word "or".
+  // so the EIN window claimed a sole proprietor's SSN and reported 987-65-4321 as 98-7654321, while
+  // the SSN window could only ever see the word "or".
+  //
+  // That OCR observation is real; the explanation this comment used to give for it was NOT. It said
+  // the two combs "sit side by side". They do not. Measured on the blank Rev. March 2024 form
+  // (612x792, pdf.js `getFieldObjects()` + `getTextContent()`) the combs are STACKED in one column:
+  // SSN caption y=425 above SSN combs y=396..420, `or` y=388, EIN caption y=377 above EIN combs
+  // y=348..372, all at x=418..576. Each caption already sits directly above its own row.
+  //
+  // The real cause is column welding. Part I's instruction prose sits at x=36, on lines y=411 and
+  // y=392 - the SAME y band as the SSN comb at y=396..420. Line segmentation therefore merges the
+  // left prose column into the right label column, and the linear text order stops reflecting the
+  // page. So captions and prose are separated by X, not by string index, and Tesseract does report
+  // a bbox per word. That is the lever this file does not yet use; see
+  // wiki/w9-part-i-caption-anchor.md. Everything below works on linear text only.
   function findTIN(text) {
-    var s = String(text || '').split('\f')[0];
-    var ein = s.match(/\b(\d{2}-\d{7})\b/); if (ein && !looksLikeZip4(ein[1])) return { tin: ein[1], kind: 'ein' };
-    var ssn = s.match(/\b(\d{3}-\d{2}-\d{4})\b/); if (ssn) return { tin: ssn[1], kind: 'ssn' };
-    var SSN_CAP = 'social security number', EIN_CAP = 'employer identification number';
+    // No `.split('\f')[0]` here: pickFormPage already hands us ONE page and the form feed is gone
+    // by then, so that scoping was dead code pretending to be a guard. Page selection is the
+    // caller's job; this function decides where ON that page the number may sit.
+    var s = String(text || '');
+    var reg = tinRegion(s);
+    // No Part I structure means no TIN region, so no TIN. Deliberate: blank is the designed-safe
+    // outcome throughout this extractor, a confident wrong number is not.
+    if (!reg) return { tin: '', kind: '' };
+    var lo = reg.lo, hi = reg.hi;
+    var win = s.slice(lo, hi);
+    // Both pristine-format pre-scans are region-bounded too. Unbounded they were the FIRST thing
+    // to run, so an already-hyphenated plant above Part I won before the comb was ever read.
+    var ein = win.match(/\b(\d{2}-\d{7})\b/); if (ein && !looksLikeZip4(ein[1])) return { tin: ein[1], kind: 'ein' };
+    var ssn = win.match(/\b(\d{3}-\d{2}-\d{4})\b/); if (ssn) return { tin: ssn[1], kind: 'ssn' };
     // Digit-confusion fixups, applied to a COPY so the captions we attribute against stay intact.
     // Pipes are box edges first and digit 1s only on a second pass.
     var sub = s.replace(/[OoQ]/g, '0').replace(/[lI]/g, '1').replace(/S/g, '5').replace(/B/g, '8').replace(/Z/g, '2');
     // Which comb does a run at `at` belong to? The form's printed grouping decides when it survives
-    // OCR. Otherwise the caption context decides - but only when ONE caption precedes the run. When
-    // both precede as an adjacent block, the run sits under a row serving both columns and linear
-    // text carries no column information, so the kind is left unknown and fmtTIN emits bare digits.
+    // OCR. Otherwise the caption context decides - but only when ONE caption precedes the run. Both
+    // captions preceding it means the linear text no longer reflects the page (prose from the left
+    // column has been welded in between them, see the note above findTIN), so there is no reliable
+    // way to say which comb the run came from. The kind is left unknown and fmtTIN emits bare digits.
     function attribute(at, rawRun) {
       var g = groupedKind(rawRun);
       if (g) return g;
       var before = s.slice(Math.max(0, at - 220), at).toLowerCase();
       var iS = before.lastIndexOf(SSN_CAP), iE = before.lastIndexOf(EIN_CAP);
       if (iS < 0 && iE < 0) return '';
-      if (iS >= 0 && iE >= 0) {
-        var between = before.slice(Math.min(iS, iE), Math.max(iS, iE));
-        var adjacent = between.length < Math.max(SSN_CAP.length, EIN_CAP.length) + 40 && !/\d/.test(between);
-        if (adjacent) return '';
-        return iS > iE ? 'ssn' : 'ein';
-      }
+      // Attribute ONLY when exactly one caption precedes the run. The old adjacency heuristic
+      // tried to tell "both captions welded together by OCR" from "one caption, then the other's
+      // box" by measuring the gap and requiring no digits in it - and a single printed digit
+      // between the two captions defeated it, returning 'ssn' for a genuine EIN. fmtTIN then
+      // rendered 123456789 as 123-45-6789: the right digits in the wrong format, which passes an
+      // operator's eyeball check and fails IRS name/TIN matching. Bare digits are what the
+      // operator verifies anyway, so ambiguity emits those instead of guessing a grouping.
+      if (iS >= 0 && iE >= 0) return '';
       return iS >= 0 ? 'ssn' : 'ein';
     }
     // An EMPTY comb box is not a TIN: its edges OCR to artifact runs (`| | | |`, `I l I l`) that the
@@ -209,10 +291,21 @@
     // single-character, so an index into `hay` addresses the same character in `s`.
     function scan(hay) {
       var re = /(?<!\d)\d(?:[\s|.,_\/\\-]{0,3}\d){8}(?!\d)/g, m;
+      // Start at the caption and stop at Part II. `hay` is always the same length as `s` (both
+      // fixup passes are single-character substitutions), so these indices address the same
+      // characters in every pass.
+      re.lastIndex = lo;
       while ((m = re.exec(hay)) !== null) {
+        if (m.index >= hi) break;
         var digits = m[0].replace(/\D/g, '');
         var rawRun = s.slice(m.index, m.index + m[0].length);
-        if (looksLikeZip4(rawRun) || looksLikeZip4(m[0])) continue;
+        // No ZIP+4 rejection in here. It failed in BOTH directions - OCR separators escaped it,
+        // and a genuine comb read as `12345 6789` is structurally IDENTICAL to a ZIP+4, so the net
+        // threw away real Tax IDs. There is no heuristic that separates those two, which is why
+        // the bound is structural instead: this loop runs between the Part I and Part II headings,
+        // and that span contains the comb labels and nothing else. Line 6 (city, state, ZIP) and
+        // the requester panel both sit above Part I and are unreachable from here.
+        // The ZIP test is kept on the pristine pre-scans above as cheap defence in depth.
         if ((rawRun.match(/\d/g) || []).length < 5) continue;
         if (/^(\d)\1{8}$/.test(digits)) continue;
         var kind = attribute(m.index, rawRun);
@@ -225,7 +318,9 @@
     // Legacy label-adjacent fallback (typed forms, "Vendor tax id: 12 3456789"). It must honour the
     // SAME rejections as the comb scan - it bypassed them, so nine literal box-edge 1s came back
     // from here as 11-1111111 after the scan had correctly refused them.
-    var m = s.match(/(?:EIN|employer identification|TIN|tax\s*id)\D{0,12}(\d[\d\s-]{7,}\d)/i);
+    // Region-bounded like the rest. This fallback carries its own label anchor, but that anchor
+    // also matches the "(TIN)" inside the masthead, so on its own it still needed the floor.
+    var m = win.match(/(?:EIN|employer identification|TIN|tax\s*id)\D{0,12}(\d[\d\s-]{7,}\d)/i);
     if (m && !looksLikeZip4(m[1])) {
       var d = m[1].replace(/\D/g, '');
       if (d.length === 9 && !/^(\d)\1{8}$/.test(d)) return { tin: fmtTIN(d, groupedKind(m[1]) || 'ein'), kind: groupedKind(m[1]) || 'ein' };
@@ -255,7 +350,14 @@
       return t.value && !/^off$/i.test(t.value) && /tax classification|c corp|s corp|partnership|sole propriet|single.member|trust|estate|limited liability|individual/i.test(t.tip);
     });
     if (cls.length) out.entity = classToEntity(cls[0].tip) || classToEntity(cls[0].value);
-    var tt = findTIN(af.text); out.tin = tt.tin; out.tinKind = tt.kind;
+    // The Tax ID is deliberately NOT read here. `af.text` is a concatenation of every AcroForm
+    // field VALUE (see acroFieldsFromStr), with no page structure and no printed captions, so a
+    // vendor authoring the PDF can add one hidden zero-sized field containing
+    // `employer identification number 123456789`, leave the real comb fields empty, and draw the
+    // true TIN as page content. A human reviewing that document sees a correctly filled W-9 while
+    // the only caption in `af.text` is the attacker's - deterministic, no OCR variance, no visual
+    // trace. On a fillable W-9 the TIN comes from the MAPPED comb fields (extractW9Fillable) or
+    // not at all. This path still contributes name, DBA and address, which carry no such leverage.
     return out;
   }
 
@@ -474,11 +576,23 @@
   // which reached the live form from a real Rev-2026 scan.
   function plausibleValue(v) {
     var s = String(v || '').trim();
-    if (s.length < 3) return false;
-    if (/[|\\<>~^_={}\[\]*“”]/.test(s)) return false;
-    if (!/[A-Za-z]{2,}|\d{3,}/.test(s)) return false;
-    var junk = (s.match(/[^A-Za-z0-9\s.,'&\-#\/()]/g) || []).length;
-    return junk <= Math.floor(s.length * 0.2);
+    // 2, not 3: `GE` and `3M` are whole company names and the old gate blanked both.
+    if (s.length < 2) return false;
+    // `|` and the curly quotes are NOT hard rejects any more. Those two are exactly what OCR
+    // produces INSIDE a legitimate value - `|` for `I`/`l`, so `R|verside's Sales & Service` was
+    // rejected whole and Company came out empty, and U+2019 for an apostrophe. They go to the junk
+    // RATIO below, which tolerates a stray mark in a long name while still rejecting a line that
+    // is mostly marks. What remains here never occurs in a typed name, so one is decisive.
+    // `°` is here because a real Rev-2026 capture OCR'd a comb box as `417° 7 7`, and the `\d{3,}`
+    // branch below would otherwise accept it on the strength of the `417`.
+    if (/[\\<>~^_={}\[\]*°]/.test(s)) return false;
+    // A value carries real words or a real number. The third alternative admits short alphanumeric
+    // marks like `3M` and `H&R`, which have neither two consecutive letters nor three digits. It is
+    // anchored, so glyph soup with spaces (`o | 38`, `417° 7 7`) still fails.
+    if (!/[A-Za-z]{2,}|\d{3,}|^(?=.*[A-Za-z])[A-Za-z0-9&.\-]{2,5}$/.test(s)) return false;
+    var junk = (s.match(/[^A-Za-z0-9\s.,'’&\-#\/()]/g) || []).length;
+    // Floor of 1: a 5-char name with one OCR artifact would otherwise fail on a ratio of 0.
+    return junk <= Math.max(1, Math.floor(s.length * 0.2));
   }
   // Pull W-9 fields from OCR (or any) free text. Best-effort + label-anchored; digit-confusion
   // fixups happen inside findTIN. Everything is a SUGGESTION.
@@ -493,7 +607,7 @@
     // ^\d+[ab]?$ also swallows the bare "3a"/"3b" item numbers 2024 introduced.
     // Structural headings (Part I/II, the account-number line, the form's own masthead) are labels,
     // never values - a Rev-2026 scan put "lll Taxpayer Identification Number (TIN) LL" in City.
-    var LABEL_NOISE = /required on this line|as shown on|do not leave|this line blank|if different|disregarded entity|name on line \d|owner'?s name|entry is required|sole propriet|check (the )?appropriate|number, street|apt\.?\s*or suite|see instructions|taxpayer identification number|list account number|^\W*part\s+[i1]{1,3}\b|certification|request for taxpayer|department of the treasury|internal revenue|enter your tin|backup withholding|^\d+[ab]?$/i;
+    var LABEL_NOISE = /required on this line|as shown on|do not leave|this line blank|if different|disregarded entity|name on line \d|owner'?s name|entry is required|sole propriet|check (the )?appropriate|number, street|apt\.?\s*or suite|see instructions|taxpayer identification number|list account number|^\W*part\s+[i1]{1,3}\b|^\W*certification\b|request for taxpayer|department of the treasury|internal revenue|enter your tin|backup withholding|^\d+[ab]?$/i;
     // The stop pattern marks where the NEXT label begins, so it is applied PER LINE and the line it
     // matches is discarded whole. Searching for it as a character offset sliced into the middle of a
     // line instead: on a real Rev-2026 scan the next label OCR'd as "o | 38 Check the appropriate
@@ -524,8 +638,12 @@
     // Anchor DBA to the real line-2 label: the 2024 line-1 instruction also contains
     // "business/disregarded entity's name", and a loose match latched onto it.
     out.dba = seg(/^\s*2\s*business name[^\n]*|business name\s*\/\s*disregarded[^\n]*|^\s*2\s*disregarded entity[^\n]*/im, /federal tax|check (the )?appropriate|exempt|address|city,/i);
-    out.street = seg(/address\s*\(number[^)]*\)|^\s*5\s+address\b/im, /city,|requester|part/i);
-    var csz = seg(/city,\s*state,?\s*and\s*zip[^\n]*|^\s*6\s+city\b/im, /requester|part/i);
+    // The stops anchor "part" to the actual Part I/II headings. Unanchored it matched INSIDE
+    // ordinary place names - `Sparta, NJ 07871` stopped the city scan on its own value - and a
+    // matching line is discarded whole, so the address silently came out empty. Same for
+    // "certification" in LABEL_NOISE above, which blanked `Rand Certification Inc`.
+    out.street = seg(/address\s*\(number[^)]*\)|^\s*5\s+address\b/im, /city,|requester|\bpart\s+[i1]{1,3}\b/i);
+    var csz = seg(/city,\s*state,?\s*and\s*zip[^\n]*|^\s*6\s+city\b/im, /requester|\bpart\s+[i1]{1,3}\b/i);
     if (csz) { var mz = csz.match(/(.+?),?\s*([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)/); if (mz) { out.city = mz[1].replace(/,\s*$/, '').trim(); out.state = mz[2].toUpperCase(); out.zip = mz[3]; } else out.city = csz; }
     var mk = raw.match(/(?:\[x\]|\bx\b\s*|☒|■|✔|✓)\s*(individual|sole propriet|c corporation|s corporation|partnership|trust|estate|limited liability|llc)/i);
     if (mk) out.entity = classToEntity(mk[1]);
@@ -563,7 +681,16 @@
   }
   function modalRoot() {
     var c = document.querySelector('input[name="details.companyName"]');
-    return c ? (c.closest('.MuiDialog-container, [role="dialog"], .MuiPaper-root') || document) : null;
+    if (!c) return null;
+    // Sequential, not one comma-list. `closest` returns the NEAREST ancestor matching ANY selector
+    // in the list regardless of the order written, so an inner `.MuiPaper-root` won and the flow
+    // was keyed to a node the UI can swap while keeping the dialog open. Prefer the outermost
+    // container, which is the thing that actually survives a step change.
+    //
+    // No `|| document` fallback. A `document` owner makes flowStale permanently FALSE - it is
+    // always connected and always contains the live form - which silently disables the entire
+    // cross-vendor guard. Returning null fails closed instead.
+    return c.closest('.MuiDialog-container') || c.closest('[role="dialog"]') || c.closest('.MuiPaper-root') || null;
   }
   function fieldByLabel(root, re) {
     var lbls = [...root.querySelectorAll('label')];
@@ -715,10 +842,13 @@
   }
   // One watcher per field per flow: a second document for the same vendor supersedes the first's
   // watcher for the field it actually refills, instead of leaving two racing on one input.
+  // Passing a null `obs` RETIRES the slot without arming a replacement, which is what a document
+  // that has nothing to contribute for this field must still do.
   function claimSlot(flow, key, obs) {
     var prev = flow.slots && flow.slots[key];
     if (prev) { try { prev.disconnect(); } catch (e) { } }
-    if (flow.slots) flow.slots[key] = obs;
+    if (!flow.slots) return;
+    if (obs) flow.slots[key] = obs; else delete flow.slots[key];
   }
   // Standing down is silent otherwise, and the UI has ALREADY promised the fill (toast + a green
   // check in the held-files list), so the operator would reach the step, find it empty, and believe
@@ -730,8 +860,10 @@
   // One drop can arm both watchers, so the flow is armed ONCE by the caller and shared - arming it
   // per watcher would make the first watcher stale the instant the second one armed.
   function watchStep2(addr, flow) {
-    if (!addr.street && !addr.city && !addr.zip) return;
     if (!flow) return;
+    // Retire the PREVIOUS document's watcher for this field even when this one has nothing to
+    // fill. See watchBillingStep for why leaving it armed leaks one vendor's data into another's.
+    if (!addr.street && !addr.city && !addr.zip) { claimSlot(flow, 'addr', null); return; }
     var filled = false;
     var obs = new MutationObserver(function () {
       if (filled) return;
@@ -786,7 +918,15 @@
   // Watch for the Create-flow Billing step (step 3) and fill its Tax ID once. Separate from
   // watchStep2 (address). The TIN is filled straight in and never logged/toasted as a value.
   function watchBillingStep(tin, flow) {
-    if (!tin || !flow) return;
+    if (!flow) return;
+    // Retire the previous document's Tax ID watcher even when THIS document has no Tax ID to fill.
+    // Returning early used to skip claimSlot entirely, and that leaks across vendors: armFlow
+    // caches the flow on the dialog node and the UI REUSES that node, so opening vendor B in the
+    // same dialog yields the SAME flow object - flowStale is correctly false, and vendor A's
+    // watcher, still armed for its full five minutes, writes A's Tax ID into B's Billing step.
+    // The guard against this is claimSlot, so it has to run on every drop, not only on the drops
+    // that happen to carry the field.
+    if (!tin) { claimSlot(flow, 'tin', null); return; }
     var filled = false;
     var obs = new MutationObserver(function () {
       if (filled) return;
@@ -838,13 +978,20 @@
     if (w9.dba) { var d = q('details.doingBusinessAs'); if (d) { setNativeValue(d, w9.dba); done.push('DBA'); } }
     if (w9.entity) { var e = root.querySelector('select[name="details.entity"]'); if (e) { setNativeValue(e, w9.entity); done.push('Entity'); } }
     surfaceDup(root);
-    if (w9.street || w9.city || w9.zip) watchStep2({ street: w9.street, city: w9.city, state: w9.state, zip: w9.zip }, flow);
-    if (w9.tin) watchBillingStep(w9.tin, flow);   // Billing step, step 3
+    // Called UNCONDITIONALLY. Each one retires the previous document's watcher for its field, and
+    // skipping the call is what left a prior vendor's watcher armed against a shared flow.
+    watchStep2({ street: w9.street, city: w9.city, state: w9.state, zip: w9.zip }, flow);
+    watchBillingStep(w9.tin, flow);   // Billing step, step 3
     var notes = ['From W-9:'];
     if (done.length) notes.push('filled ' + done.join(', '));
     if (w9.street) notes.push('address on step 2');
     if (w9.tin) notes.push('Tax ID on the Billing step (kept local)');  // never the value
     if (!w9.entity) notes.push('confirm Entity');
+    // Absence was the only signal that a field did not read, and absence from a list of successes
+    // reads as "nothing to mention". Name what is missing, especially the Tax ID: the region bound
+    // added in 0.9.1 makes a blank TIN a normal outcome rather than a rare one.
+    var missing = w9Missing(w9);
+    if (missing.length) notes.push('NOT read: ' + missing.join(', ') + ' - enter ' + (missing.length > 1 ? 'them' : 'it') + ' manually');
     notes.push('review before Create');
     toast(notes.join(' · '), 13000);
   }
@@ -855,6 +1002,16 @@
     if (w9.name) f.push('Company'); if (w9.dba) f.push('DBA'); if (w9.entity) f.push('Entity');
     if (w9.street || w9.city || w9.zip) f.push('Address'); if (w9.tin) f.push('Tax ID (local)');
     return f;
+  }
+  // The complement of w9Fields. DBA and Entity are deliberately absent: a W-9 legitimately has no
+  // DBA, so listing it as missing would cry wolf on most documents. These three are always
+  // expected on a valid form, so their absence is a real finding the operator has to act on.
+  function w9Missing(w9) {
+    var m = [];
+    if (!w9.name) m.push('Company');
+    if (!w9.street && !w9.city && !w9.zip) m.push('Address');
+    if (!w9.tin) m.push('Tax ID');
+    return m;
   }
   function prospectFields(p) {
     var f = [];
@@ -881,7 +1038,12 @@
         var w9 = extractW9FromText(text);
         if (w9.name || w9.tin || w9.dba || w9.street) {
           fillFromW9(root, w9, armed);
-          toast('OCR done - REVIEW every field before saving, the Tax ID especially (OCR can misread digits).', 15000);
+          // "the Tax ID especially" told the operator to check a number that is often not there:
+          // it is dropped when no TIN was read, and what DID fail to read is named instead.
+          var miss = w9Missing(w9);
+          toast('OCR done - REVIEW every field before saving' +
+            (w9.tin ? ', the Tax ID especially (OCR can misread digits)' : '') + '.' +
+            (miss.length ? ' NOT read: ' + miss.join(', ') + ' - enter ' + (miss.length > 1 ? 'them' : 'it') + ' manually.' : ''), 15000);
           return { ok: true, label: 'Scanned W-9 (OCR)', fields: w9Fields(w9) };
         }
         toast('OCR ran but could not confidently read the W-9 fields - enter them manually.', 12000);
