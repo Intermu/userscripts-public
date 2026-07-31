@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.14
+// @version      1.66.15
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -7478,7 +7478,15 @@
     var dockBornTs = Date.now();
     var dockHostId = 'h' + Math.random().toString(36).slice(2) + dockBornTs.toString(36);
     var dockAmHost = true;
-    var dockRoster = {};                           // key -> {key,label,icon,weight,badge,minRank,title,order,seen}
+    var dockOtherSeen = 0;                         // last bwn:dock:host/ping heard from a FOREIGN host
+    // Null prototype on purpose. `dockRoster[d.key] = {...}` with the key '__proto__' otherwise
+    // hits the inherited setter instead of creating an own property: Object.keys never sees it, so
+    // no row and no diagnostic - and worse, the entry is then INHERITED, after which any of its
+    // truthy-valued keys ('seen' is always a timestamp; also 'weight', 'minRank', 'key') satisfies
+    // the `dockRoster[d.key]` gates on update and unregister. With no
+    // prototype there is nothing to pollute and nothing to inherit, and a '__proto__' key renders
+    // as an ordinary row like 'constructor' already does.
+    var dockRoster = Object.create(null);          // key -> {key,label,icon,weight,badge,minRank,title,order,seen}
     var dockOrderSeq = 0;
     var dockRank = null;                           // reader's rank (UX gating only; server is the real boundary)
     var dockRenderT = null;
@@ -7614,17 +7622,22 @@
       try { document.documentElement.style.setProperty('--bwn-dock-w', px + 'px'); } catch (e) { }
     }
     function renderDock() {
+      // Above EVERY early return, not just the signature check. The stylesheet is what makes the
+      // fallback pill visible too, so a demoted page and a zero-registrant page have to repair a
+      // deleted #bwn-launch-style exactly as much as a rendering rail does - and those are the two
+      // states Core sits in when it runs alone. Idempotent, and it appends to document.head while
+      // the observer watches document.body, so it cannot restart the rebuild loop.
+      ensureStyle();
       if (!dockAmHost) { removeDockStack(); return; }
       var vis = dockVisible();
       var pill = document.getElementById(DOCK_ID);
       var stack = document.getElementById(DOCK_STACK_ID);
       // Zero registrants: no rail; the standalone Tools pill stays as the fallback launcher.
       if (!vis.length) { if (stack) stack.remove(); if (pill) pill.style.display = ''; dockSig = ''; publishDockWidth(0); return; }
-      // These two run BEFORE the signature check on purpose. Both are idempotent and neither
-      // writes into the rail subtree, so they cannot restart the rebuild loop - but they are
-      // repairs, and the old unconditional rebuild is what used to re-run them. Behind the early
-      // return, a removed stylesheet or an ensureDock-recreated pill would never be fixed.
-      ensureStyle();
+      // Runs BEFORE the signature check on purpose: idempotent, does not write into the rail
+      // subtree (an attribute write against a childList-only observer), and it is a repair - behind
+      // the early return an ensureDock-recreated pill would never be re-hidden. It stays BELOW the
+      // zero-registrant branch so it cannot fight that branch's pill restore.
       if (pill) pill.style.display = 'none';   // Tools folds into the rail's footer row
       var sig = dockSignature(vis, dockIsCollapsed());
       // Unchanged roster AND the rail is still intact: touch nothing. The firstChild test keeps
@@ -7696,7 +7709,11 @@
     document.addEventListener('bwn:evt', BWN.guard(function (e) {
       var d = e && e.detail; if (!d || !d.id) return;
       if (d.id === 'bwn:role' && typeof d.rank === 'number') { dockRank = d.rank; scheduleDockRender(); return; }
-      if (d.id === 'bwn:dock:host') { if (dockOtherWins(d)) { dockAmHost = false; removeDockStack(); } return; }
+      if (d.id === 'bwn:dock:host') { if (dockOtherWins(d)) { dockAmHost = false; dockOtherSeen = Date.now(); removeDockStack(); } return; }
+      // A host that is still alive re-announces AND pings every DOCK_PING_MS; that traffic is what
+      // holds off the reclaim in the heartbeat. Guarded on hostId so our own ping - same document,
+      // same listener - never counts as somebody else's.
+      if (d.id === 'bwn:dock:ping' && d.hostId && d.hostId !== dockHostId) { dockOtherSeen = Date.now(); return; }
       if (!dockAmHost) return;
       if (d.id === 'bwn:dock:register' && d.key) {
         var ex = dockRoster[d.key];
@@ -7733,7 +7750,16 @@
 
     // Heartbeat: re-announce (registrants re-register on it) + ping + drop stale entries.
     setInterval(BWN.guard(function () {
-      if (!dockAmHost) return;
+      // Reclaim. dockAmHost used to be a one-way latch: ONE bwn:dock:host from anything on the page
+      // - a real second host that then closed, or a spoofed priority:999 - demoted this dock for the
+      // rest of the page's life, with no path back. A live winner re-announces and pings every
+      // DOCK_PING_MS, so silence past the same TTL an entry gets means it is gone. If it is in fact
+      // alive, our announce loses to it again on the same total order and we demote right back, so
+      // the worst case is one wasted render, not two rails.
+      if (!dockAmHost) {
+        if (Date.now() - dockOtherSeen <= DOCK_TTL_MS) return;
+        dockAmHost = true; dockSig = '';   // roster went stale while demoted; the announce refills it
+      }
       dockAnnounce(); dockPing(); pruneDock(); scheduleDockRender();
     }, 'launcher:dockbeat'), DOCK_PING_MS);
 
