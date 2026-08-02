@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.15
+// @version      1.66.16
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -44,7 +44,7 @@
   try { localStorage.setItem('bwn:status:core', JSON.stringify({ ver: BWN_VER, ts: Date.now() })); } catch (e) { /* best-effort */ }
 
   console.info('[BWN SUITE CORE] v' + BWN_VER + ' |',
-    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.64 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.16 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
+    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.65 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.16 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
     'enabled:', Object.keys(BWN_MODULES).filter(function (k) { return BWN_MODULES[k]; }).join(', '));
 
   // ===== BWN SHARED CORE v7 - KEEP IN SYNC across both suite scripts =====
@@ -1091,7 +1091,7 @@
   });
 
   // ==========================================================================
-  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.64 (Connector 1.2)
+  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.65 (Connector 1.2)
   // ==========================================================================
   if (BWN_MODULES.woAssist) BWN.safeModule('woAssist', function () {
     'use strict';
@@ -1121,7 +1121,7 @@
     var PANEL_ID = 'bwn-gp-panel';
     var GREEN = BWN.GREEN;
 
-    console.info('[BWN GP] WO Assist v2.64 loaded on', location.href);
+    console.info('[BWN GP] WO Assist v2.65 loaded on', location.href);
 
     // ---- Parsing helpers (shared via BWN core) -----------------------------
     var parseMoney = BWN.parseMoney;
@@ -1151,7 +1151,7 @@
     }
     function nvVendor(s) { return (s || '').replace(/\s+/g, ' ').trim().toUpperCase(); }   // normalize for cross-page (trips vs PO rows) vendor comparison
     function readPOs() {
-      var out = [];
+      var out = [], seenSids = {};
       document.querySelectorAll('[data-testid^="POAccordion-"]').forEach(function (row) {
         var txt2 = row.textContent || '';
         var amts = [];
@@ -1170,6 +1170,14 @@
         // why /revoked?/ must NOT be matched loosely.
         var vend = vendorOf(row);
         var num = (row.getAttribute('data-testid') || '').replace('POAccordion-', '') || (out.length + 1) + '';
+        // Stable per-PO identity for act KEYS (poKeyOf ladder, defined below in this same
+        // module: Umbrava's assigned line number -> vendor GUID -> render index). The
+        // POAccordion-<n> render index in `num` re-sequences when a PO is added or
+        // cancelled, which orphaned checked state AND let structConvergeReason read the
+        // WRONG PO's done flag. `num` stays for display + the POAccordion-<n> nav lookup.
+        var sid = poKeyOf(row);
+        if (seenSids[sid]) sid = sid + '-' + num;   // two POs can share a vendor (GUID fallback) - keys must stay distinct
+        seenSids[sid] = 1;
         // Isolate the PO's OWN status: the text between the leading {num}{date} and the
         // vendor name, so status keywords never collide with the Description. Rows read
         // e.g. "001 03/03/2026 Confirm Complete VENDOR $…" / "003 05/08/2026 Open
@@ -1202,7 +1210,7 @@
         // Word-boundaried so a Description word ("avoid"/"prepaid") can't false-match and
         // drop a genuinely cost-open PO (parity with the terminal safety-net regex).
         var costOpen = amt > 0 && !/\b(cancell?ed|declined|revoked|void)\b/i.test(costRegion) && !/\b(paid|invoiced)\b/i.test(costRegion);
-        out.push({ vendor: vend, num: num, amount: amt, schedDate: schedDate, done: done, poStatus: poStatus, statusText: statusRegion, costOpen: costOpen });
+        out.push({ vendor: vend, num: num, sid: sid, amount: amt, schedDate: schedDate, done: done, poStatus: poStatus, statusText: statusRegion, costOpen: costOpen });
       });
       return out;
     }
@@ -2454,7 +2462,11 @@
           label: esc.label,
           why: escReason + ' · ' + esc.tierName + ' tier',
           text: 'Re: ' + ref + '. ' + esc.lead + escReason + '. Routine follow-up has not resolved this - need a decision on next steps (extend / re-source / price / close).',
-          owner: esc.owner
+          owner: esc.owner,
+          // Carried for the render layer only: armAssistDue emits bwn:assist:due with this
+          // value so the assist drawer POSTs the engine's own severity (the server can bump
+          // the tier on it). Not part of the key, the label, or any stored state.
+          sev: escSev
         });
       }
 
@@ -2541,13 +2553,13 @@
         if (!(p.amount > 0)) return;
         if (p.poStatus === 'materials' && !p.done) {
           poThemes.materials = 1;
-          acts.push({ key: 'pomat:' + p.num + ':' + p.vendor, label: 'Chase ' + p.vendor + ' for material delivery ETA + tracking', why: 'PO ' + p.num + (p.statusText ? ' - ' + p.statusText : ' - materials ordered'), text: 'Hi - re: ' + ref + '. On PO ' + p.num + ': please confirm the materials - supplier, expected delivery date, and tracking #. Once they land, reply with the return-visit date so I can update the client.', resolve: ACT_SIGNALS.parts });
+          acts.push({ key: 'pomat:' + p.sid + ':' + p.vendor, poNum: p.num, label: 'Chase ' + p.vendor + ' for material delivery ETA + tracking', why: 'PO ' + p.num + (p.statusText ? ' - ' + p.statusText : ' - materials ordered'), text: 'Hi - re: ' + ref + '. On PO ' + p.num + ': please confirm the materials - supplier, expected delivery date, and tracking #. Once they land, reply with the return-visit date so I can update the client.', resolve: ACT_SIGNALS.parts });
         } else if (p.poStatus === 'accept') {
           poThemes.accept = 1;
-          acts.push({ key: 'poacc:' + p.num + ':' + p.vendor, label: p.vendor + ' has not accepted PO ' + p.num, why: 'PO ' + p.num + ' pending vendor acceptance', text: 'Hi - re: ' + ref + '. PO ' + p.num + ' is still pending your acceptance. Please accept with a scheduled date, or decline today so I can reassign coverage.', resolve: ACT_SIGNALS.quote });
+          acts.push({ key: 'poacc:' + p.sid + ':' + p.vendor, poNum: p.num, label: p.vendor + ' has not accepted PO ' + p.num, why: 'PO ' + p.num + ' pending vendor acceptance', text: 'Hi - re: ' + ref + '. PO ' + p.num + ' is still pending your acceptance. Please accept with a scheduled date, or decline today so I can reassign coverage.', resolve: ACT_SIGNALS.quote });
         } else if (p.poStatus === 'confirm') {
           poThemes.confirm = 1;
-          acts.push({ key: 'poconf:' + p.num + ':' + p.vendor, label: 'Confirm ' + p.vendor + ' completion + collect docs', why: 'PO ' + p.num + ' marked Confirm Complete', text: 'Hi - re: ' + ref + '. PO ' + p.num + ' is marked complete - please upload the completion package (signed ticket, sign-in/out, before/after photos) so we can confirm and invoice.', resolve: ACT_SIGNALS.stall });
+          acts.push({ key: 'poconf:' + p.sid + ':' + p.vendor, poNum: p.num, label: 'Confirm ' + p.vendor + ' completion + collect docs', why: 'PO ' + p.num + ' marked Confirm Complete', text: 'Hi - re: ' + ref + '. PO ' + p.num + ' is marked complete - please upload the completion package (signed ticket, sign-in/out, before/after photos) so we can confirm and invoice.', resolve: ACT_SIGNALS.stall });
         }
       });
 
@@ -2559,7 +2571,8 @@
         state.pos.forEach(function (p) {
           if (!p.costOpen) return;
           acts.push({
-            key: 'pocost:' + p.num + ':' + p.vendor,
+            key: 'pocost:' + p.sid + ':' + p.vendor,
+            poNum: p.num,
             label: 'Confirm the final cost on PO ' + p.num + ' (' + p.vendor + ') is correct',
             why: 'PO ' + p.num + (p.statusText ? ' - ' + p.statusText : '') + ' · ' + fmt(p.amount) + ' - verify the billed total before marking Work Complete',
             text: 'Hi - re: ' + ref + '. Before we close out PO ' + p.num + ', please confirm your final cost is ' + fmt(p.amount) + ' (or send the corrected final total) so billing matches the work performed.'
@@ -2760,6 +2773,36 @@
       } catch (e) { return {}; }
     }
     function actsSave(d) { try { localStorage.setItem(actsKey(), JSON.stringify(d)); } catch (e) { /* best-effort */ } }
+    // ONE-TIME per-WO store migration for the PO act re-key (render index -> stable sid,
+    // 2026-08-02). Old keys look like 'pomat:2:ACME' - a BARE-DIGITS middle, which the new
+    // form never produces (the poKeyOf ladder yields 'ln001' / 'v<guid>' / 'ix2', plus a
+    // '-<num>' collision suffix). An old record maps to a new key only when exactly ONE
+    // current PO carries that vendor; an ambiguous or vanished vendor leaves the record in
+    // place, inert - a step re-appearing unchecked is the safe direction, false-checking
+    // via a guessed mapping is not. Mirrors actsMigrate above (mutates d; returns d when
+    // changed, null when not). Cannot live in actsLoad like the authored-key migration -
+    // it needs state.pos - so renderActsInline runs it once per WO page-load.
+    function actsMigratePO(d, pos) {
+      var changed = false, k, m;
+      var byVendor = {};
+      (pos || []).forEach(function (p) {
+        if (!p || !p.sid) return;
+        var v = String(p.vendor || '');
+        byVendor[v] = Object.prototype.hasOwnProperty.call(byVendor, v) ? null : p;   // null = ambiguous
+      });
+      for (k in d) {
+        m = /^(pomat|poacc|poconf|pocost):(\d+):(.+)$/.exec(k);
+        if (!m) continue;
+        var p2 = byVendor[m[3]];
+        if (!p2) continue;                          // vendor gone or ambiguous - leave the record inert
+        var nk = m[1] + ':' + p2.sid + ':' + m[3];
+        if (!d[nk]) d[nk] = d[k];
+        delete d[k];
+        changed = true;
+      }
+      return changed ? d : null;
+    }
+    var actsMigratedPOFor = '';   // latch: once per WO page-load (the store is per-WO)
 
     function findAddNoteBtn() {
       var btns = document.querySelectorAll('button');
@@ -3345,18 +3388,22 @@
     // note-only remainder the spec named - materials/completion tied to a PO, and the trip
     // no-show, which is fed by the trips cache INDEPENDENT of PO state (so a PO that
     // completed with no per-PO status would otherwise keep nagging until a note matched).
-    function poByNum(state, num) {
+    // Sid lookup, NOT render-index lookup (2026-08-02 re-key): matching parts[1] against
+    // p.num was the false-CHECK half of the render-index defect - after a PO add/cancel
+    // re-sequenced the list, this read the WRONG PO's done flag and could auto-check an
+    // open step. A sid that matches nothing returns null, which converges NOTHING.
+    function poBySid(state, sid) {
       var ps = (state && state.pos) || [];
-      for (var i = 0; i < ps.length; i++) if (String(ps[i].num) === String(num)) return ps[i];
+      for (var i = 0; i < ps.length; i++) if (String(ps[i].sid) === String(sid)) return ps[i];
       return null;
     }
     function structConvergeReason(a, state) {
       if (!a || !state) return null;
       var parts = (a.key || '').split(':'), pfx = parts[0];
       if (pfx === 'pomat' || pfx === 'poconf') {          // materials / completion, per PO
-        var p = poByNum(state, parts[1]);
-        if (p && p.done) return 'PO ' + parts[1] + ' is marked done';
-        if (pfx === 'pomat' && p && p.poStatus && p.poStatus !== 'materials') return 'PO ' + parts[1] + ' is no longer awaiting materials';
+        var p = poBySid(state, parts[1]);
+        if (p && p.done) return 'PO ' + p.num + ' is marked done';
+        if (pfx === 'pomat' && p && p.poStatus && p.poStatus !== 'materials') return 'PO ' + p.num + ' is no longer awaiting materials';
       }
       if (pfx === 'noshow' && state.noShow) {              // trips-cache no-show vs. the real PO ledger
         var nv = nvVendor(state.noShow.vendor);
@@ -3397,26 +3444,26 @@
     // opens that tool's drawer over the existing dock bus. It renders ONLY when the
     // registrant is currently registered, so a disabled module or a WO the tool does not
     // apply to yields no button rather than a dead control.
-    // PINNED against the live registrant table (2026-07-28): the dock has exactly four
-    // registrants - dispatch / cc / wo-audit / ask ([[bwn-launcher-dock]]). Only the
-    // dispatch mapping is real today: "Recruit / dispatch a vendor" (phase:schedule, the
-    // Pending Dispatch status) and the intake scoping step are precisely what the Dispatch
-    // drawer does, and the registrant self-gates to Pending Dispatch WOs - so presence
-    // does the status gating for free. Email RFP (bid-out) and AI Draft (suite-ai) are
-    // NOT dock registrants (they answer bwn:cmd only), so their presence cannot be
-    // detected and they are deliberately absent here; wiring them needs a one-line
-    // registration in each of those scripts, which is outside this Core-only phase.
+    // PINNED against the live registrant table ([[bwn-launcher-dock]]): dispatch / cc /
+    // wo-audit / assist / ask, plus `bidout` (bwn-bid-out 0.26.0, registered 2026-08-02
+    // exactly so this mapping could exist - it is dynamic on WO detail pages the way
+    // dispatch is dynamic on Pending Dispatch). A step key maps to the tools that DO
+    // that step: "Recruit / dispatch a vendor" (phase:schedule) and the intake scoping
+    // step offer BOTH paths to coverage - the Dispatch drawer (network vendor; its
+    // registrant self-gates to Pending Dispatch WOs, so presence does the status gating
+    // for free) and Email RFP (outside / net-new vendors). AI Draft (suite-ai) is still
+    // NOT a dock registrant (it answers bwn:cmd only), so it stays deliberately absent.
     // `escalate` -> the assist drawer (bwn-wo-assist), added once /api/wo-assist went live:
     // the escalation step is the one row whose whole point is handing the job to someone
     // else, and the assist tool is what actually routes it. Presence gating does the rest -
-    // the button only exists where the assist script is installed and registered, so a
-    // coordinator without it sees the row exactly as before.
-    var ACT_TOOL = { 'phase:schedule': 'dispatch', 'phase:intake': 'dispatch', escalate: 'assist' };
-    var ACT_TOOL_LABEL = { dispatch: 'Dispatch\u2026', cc: 'CC Request\u2026', 'wo-audit': 'WO Audit\u2026', ask: 'Ask BWN\u2026', assist: 'Escalate\u2026' };
+    // a button only exists where its registrant is installed and registered, so a
+    // coordinator without the script sees the row exactly as before.
+    var ACT_TOOL = { 'phase:schedule': ['dispatch', 'bidout'], 'phase:intake': ['dispatch', 'bidout'], escalate: ['assist'] };
+    var ACT_TOOL_LABEL = { dispatch: 'Dispatch\u2026', cc: 'CC Request\u2026', 'wo-audit': 'WO Audit\u2026', ask: 'Ask BWN\u2026', assist: 'Escalate\u2026', bidout: 'Email RFP\u2026' };
     function actTool(a) {
       if (!a || a.anchor || a.authored) return null;   // authored items are free text - no reliable tool to infer
       var d = ACT_TOOL[a.key] || ACT_TOOL[(a.key || '').split(':')[0]];
-      return d ? { dock: d } : null;
+      return d ? { docks: d } : null;
     }
     // Dock presence, WO Assist side. The Launcher module owns dockRoster but lives in its
     // own IIFE, so this listens to the same bus independently: registrants re-announce on
@@ -3432,6 +3479,26 @@
       else if (d.id === 'bwn:dock:unregister') delete waDockSeen[d.key];
     }, false);
 
+    // ESCALATE SEVERITY HANDOFF. The engine computes escSev (how far past the escalate
+    // clock, >=1 at fire) but the assist drawer runs in its own sandbox and only hears the
+    // bus: bwn:assist:due {escSev} arms bwn-wo-assist's _pendingSev, which rides the POST
+    // as escSev so the SERVER can bump the tier (supervisor -> management) for a WO far
+    // past its clock. Fired at render time - the engine stays pure. Latched per
+    // path+key per page load (re-arming would be harmless, _pendingSev is consumed on
+    // open, but the bus stays quiet), and gated on the assist registrant being LIVE so
+    // the event cannot fire before a listener exists: the checklist signature includes
+    // the live-dock set, so assist coming online re-renders the card and this re-runs.
+    var assistDueSent = {};
+    function armAssistDue(a, isDone) {
+      if (isDone || !a || typeof a.sev !== 'number') return;
+      if ((a.key || '').split(':')[0] !== 'escalate') return;
+      if (!waDockAlive('assist')) return;
+      var k = location.pathname + '|' + a.key;
+      if (assistDueSent[k]) return;
+      assistDueSent[k] = 1;
+      try { document.dispatchEvent(new CustomEvent('bwn:evt', { detail: { id: 'bwn:assist:due', escSev: a.sev } })); } catch (e) { }
+    }
+
     // IN-PAGE NAVIGATION. Clicking a step label walks the page to the thing it is about.
     // Only targets with a PROVEN selector are offered (the same ones the engine already
     // reads): PO rows by their own testid, the ECD picker, the DNE/NTE input. Anything
@@ -3440,7 +3507,10 @@
     function actNav(a) {
       if (!a || a.anchor) return null;
       var parts = (a.key || '').split(':'), p = parts[0];
-      if ((p === 'pomat' || p === 'poacc' || p === 'poconf' || p === 'pocost') && parts[1]) return { kind: 'po', num: parts[1] };
+      // PO keys carry a STABLE sid in parts[1] (2026-08-02 re-key), which is not the
+      // POAccordion-<n> testid value - navigation rides the act's own poNum (the render
+      // index, refreshed every render). parts[1] stays as a last-resort fallback only.
+      if ((p === 'pomat' || p === 'poacc' || p === 'poconf' || p === 'pocost') && parts[1]) return { kind: 'po', num: a.poNum != null ? a.poNum : parts[1] };
       if (p === 'ecd') return { kind: 'ecd' };
       if (p === 'intake' && /\bNTE\b/.test(a.why || '')) return { kind: 'nte' };
       return null;
@@ -3501,6 +3571,13 @@
       var row = actsAnchorBlock();
       if (!acts.length || !row) { if (card) card.remove(); return; }
       ensureWAStyle();
+      // PO-key store migration runs BEFORE anything reads or writes the store this
+      // page-load (autoDetectActioned loads it next line-ish) - see actsMigratePO.
+      if (actsMigratedPOFor !== actsKey()) {
+        actsMigratedPOFor = actsKey();
+        var mig0 = actsMigratePO(actsLoad(), state.pos);
+        if (mig0) actsSave(mig0);
+      }
       autoDetectActioned(acts, state);
       var store = actsLoad();
       // Open steps first (already worst-first from nextActions), done steps sink to the
@@ -3522,7 +3599,7 @@
         // real content changes - without them the gate would hold a stale card.
         var tl = actTool(a);
         return a.key + '|' + a.label + '|' + (r && r.done ? 1 : 0) + '|' + ((r && r.note) || '') + '|' + (a.nudge || 0) + '|' + ((r && r.reason) || '') +
-          '|' + ((tl && waDockAlive(tl.dock)) ? tl.dock : '') + '|' + (actHelpOpen[a.key] ? 1 : 0);
+          '|' + (tl ? tl.docks.filter(waDockAlive).join(',') : '') + '|' + (actHelpOpen[a.key] ? 1 : 0);
       })]);
       if (card && card.isConnected && card.nextElementSibling === row && card.dataset.sig === sig) return;
       if (card) card.remove();
@@ -3664,19 +3741,25 @@
             main.appendChild(lg);
           }
           var btns = document.createElement('div'); btns.className = 'bwn-act-btns';
+          armAssistDue(a, isDone);
           // Phase 2 tool launch - rendered only while the owning dock registrant is live,
           // so this is never a dead control. The click is the same bwn:dock:open the rail
-          // itself emits, so the tool opens exactly as if launched from the dock.
+          // itself emits, so the tool opens exactly as if launched from the dock. A step
+          // can map to more than one tool (recruit = Dispatch OR Email RFP); each button
+          // gates on its OWN registrant, so only installed-and-live tools render.
           var tool = actTool(a);
-          if (tool && waDockAlive(tool.dock) && !isDone) {
-            var tb = document.createElement('button');
-            tb.type = 'button'; tb.className = 'bwn-wa-btn ghost'; tb.textContent = ACT_TOOL_LABEL[tool.dock] || 'Open tool…';
-            tb.style.cssText = 'padding:3px 9px;font-size:10px;';
-            tb.title = 'Open the ' + (ACT_TOOL_LABEL[tool.dock] || 'tool').replace(/…$/, '') + ' drawer for this work order';
-            tb.addEventListener('click', function () {
-              try { document.dispatchEvent(new CustomEvent('bwn:evt', { detail: { id: 'bwn:dock:open', key: tool.dock } })); } catch (e) { }
+          if (tool && !isDone) {
+            tool.docks.forEach(function (dk) {
+              if (!waDockAlive(dk)) return;
+              var tb = document.createElement('button');
+              tb.type = 'button'; tb.className = 'bwn-wa-btn ghost'; tb.textContent = ACT_TOOL_LABEL[dk] || 'Open tool…';
+              tb.style.cssText = 'padding:3px 9px;font-size:10px;';
+              tb.title = 'Open the ' + (ACT_TOOL_LABEL[dk] || 'tool').replace(/…$/, '') + ' drawer for this work order';
+              tb.addEventListener('click', function () {
+                try { document.dispatchEvent(new CustomEvent('bwn:evt', { detail: { id: 'bwn:dock:open', key: dk } })); } catch (e) { }
+              });
+              btns.appendChild(tb);
             });
-            btns.appendChild(tb);
           }
           if (a.text) {
             var cp = document.createElement('button');
