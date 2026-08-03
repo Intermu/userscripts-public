@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.16
+// @version      1.66.17
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -1666,7 +1666,7 @@
         // fast a status is "past its limit". Read the WO-header Priority field; the
         // raw text (e.g. "P2 - Normal (24 hrs)") is passed through - bwnPrioNum pulls
         // the P#. Empty -> neutral 1.0 multiplier (never guesses a harsher clock).
-        priority: fieldByLabel(/^priority\b/i),
+        priority: fieldByLabel(/^(?:wo )?priority\b/i),
         // Intake actionability fields (Phase 2). Empty '' when the field is unset OR
         // not present as a labeled field - the intake gate treats '' as "verify", not
         // a hard assertion, so a mis-read only over-surfaces (the safe direction).
@@ -4511,6 +4511,11 @@
           client: hd.client || '', addr: hd.addr || '',
           coordinator: hd.coordinator || '', sourceJob: hd.sourceJob || '', sourcePo: hd.sourcePo || '',
           status: st.status, hrs: st.hrs,
+          // bwn-wo-assist prefills its escalation POST from bus.priority / bus.trade - the
+          // drawer read these keys from day one, but the publish never carried them, so the
+          // first live escalation (W-371126, 2026-08-03) rendered '-' for both.
+          priority: st.priority || '',
+          trade: ((st.woApi && st.woApi.trades && st.woApi.trades.map) ? st.woApi.trades.map(function (t) { return t && t.name; }).filter(Boolean).join(', ') : '') || hd.trade || '',
           staleDays: (st.staleDays != null ? st.staleDays : null), noteCount: (st.noteCount != null ? st.noteCount : null), lastNote: st.lastNote || null,
           vendorTotal: (st.vendorTotal != null ? st.vendorTotal : null),
           dne: st.nte ? st.nte.amount : null, dneSource: st.nte ? st.nte.source : null,
