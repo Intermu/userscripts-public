@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Dispatch (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.6.0
+// @version      0.7.0
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-dispatch.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-dispatch.user.js
 // @description  One-click Dispatch for a work order - replaces manually typing a row into Dispatch_Notifications.xlsx. The Dispatch launcher shows only on a WO that is in "Pending Dispatch". It opens a confirm modal prefilled from the BWN Ops Suite bus (Tracking) and a same-origin Umbrava GraphQL read (Location as the site NUMBER, Priority, and the coordinator to ping): it uses the person this WO is assigned to (whoever a supervisor/manager assigned it to, read live when you open it), and when that is a team or blank it falls back to the coordinator from the most recent work order(s) at the same location. The coordinator name + email are editable before you send. On submit it POSTs the 5 typed fields plus the WO number (read from the URL, never typed - the flow needs it to deep-link the card, because Tracking is the CLIENT's tracking number and points at the wrong record) to the broadway-internal-ops SWA proxy (x-bwn-key gated) which forwards to the HTTP-triggered "Dispatch HTTP" Power Automate flow - the flow adds the row to Dispatch_Notifications.xlsx AND dispatches it (posts a Teams adaptive card to the coordinator and waits for their accept). Dispatching is a coordinator action, so there is no role gate (the x-bwn-key is the boundary). The assignee's email is not on the WO record (Umbrava exposes the coordinator NAME only), so it is resolved from a per-user name->email roster you maintain (seeded with you, and it remembers each coordinator you dispatch to); for a coordinator the roster has never met it falls back to a GUESS derived from the house name pattern and the signed-in user's own domain, shown with a "check it before you send" warning and always editable - never a silent send to an address nobody confirmed. The flow's secret URL stays server-side; nothing sensitive lives in this script. Registers a single "Dispatch" launcher into the shared dock (bwn:dock:*) - the dock tab is the only launcher; no floating fallback button.
@@ -339,10 +339,16 @@
     // Teams card unreadable and silently missed the site lookup on every dispatch (measured on
     // the first correctly-targeted card, 2026-08-03). The live read below fills the site number
     // from `locationId`; the name is shown as a hint under the field instead of being sent.
+    // Tracking has the SAME hazard one field up, and it bit on 2026-08-03. The bus value is a DOM
+    // scrape of the header's tracking-number element; when that is missing or the bus entry is
+    // stale, this used to fall back to the WO number IMMEDIATELY - which filled the field, so the
+    // live read's `setIfEmpty` could never correct it. Queue row 466 went out as Tracking 383441
+    // on a WO whose real client tracking number is 1273641. The fallback now happens only AFTER
+    // the live read has had its say (see hydrateFromUmbrava), so a blank here is temporary.
     var pre = {
       AssignedToName: busCoord,
       AssigneeEmail: busCoord ? rosterLookup(busCoord) : '',
-      Tracking: (bus && bus.tracking) ? String(bus.tracking).trim() : (woId || ''),
+      Tracking: (bus && bus.tracking) ? String(bus.tracking).trim() : '',
       Location: '',
       Priority: ''
     };
@@ -520,10 +526,12 @@
   }
 
   // Background prefill upgrade: read the current WO live and patch the fields the user has
-  // not typed into. Tracking / Location / Priority fill only if empty. The coordinator NAME
-  // resolves to a PERSON: the WO's live assignee if that is a real person (who a supervisor/
-  // manager assigned it to), else the coordinator from the most recent work order(s) at the
-  // same location; a team assignee is skipped in favour of that history person. Best-effort.
+  // not typed into. Location / Priority fill only if empty. TRACKING is different: the live read
+  // OVERWRITES the bus seed, because the bus value is a DOM scrape and this one is the record.
+  // The coordinator NAME resolves to a PERSON: the WO's live assignee if that is a real person
+  // (who a supervisor/manager assigned it to), else the coordinator from the most recent work
+  // order(s) at the same location; a team assignee is skipped in favour of that history person.
+  // Best-effort.
   function hydrateFromUmbrava(woId, inputs, touched) {
     var n = parseInt(woId, 10);
     function setIfEmpty(k, v) {
@@ -538,9 +546,25 @@
       inputs.AssignedToName.value = v;
       fillEmailFor(inputs, touched, v);
     }
+    // The WO record beats the header scrape. setIfEmpty cannot do this job: a stale or missing
+    // bus entry leaves a non-empty WRONG value behind (the 2026-08-03 row-466 defect), and
+    // "only if empty" is exactly what let it stand.
+    function setTracking(v) {
+      v = (v == null) ? '' : String(v).trim();
+      if (!v || touched.Tracking) return;
+      inputs.Tracking.value = v;
+    }
+    // Last resort, and deliberately AFTER the read: a WO with no client tracking number still
+    // needs a value in this required field, but the WO number must never pre-empt a real one.
+    // Runs on the failure path too, so losing GraphQL degrades to the old behaviour, not a block.
+    function trackingFallback() {
+      var el = inputs.Tracking;
+      if (el && !touched.Tracking && !el.value.trim() && woId) el.value = String(woId);
+    }
     gql(DISP_WO_Q, { n: n }).then(function (d) {
       var wo = (d && d.workOrder) || {};
-      setIfEmpty('Tracking', wo.trackingNumber);
+      setTracking(wo.trackingNumber);
+      trackingFallback();
       // locationId, NOT locationName: the flow's `Lookup site` keys on the bare site number, and
       // a display name silently resolves to no site at all (see the pre-fill comment above).
       setIfEmpty('Location', wo.locationId);
@@ -554,7 +578,7 @@
           else if (name) setName(name);   // no history person found - fall back to showing the team
         });
       } else if (name) { setName(name); }
-    }, function () { /* GraphQL unavailable - bus prefill stands */ });
+    }, function () { /* GraphQL unavailable - bus prefill stands */ trackingFallback(); });
   }
   // Prefill AssigneeEmail from the roster (or from the signed-in user when the name matches
   // them), only if untouched + empty.
