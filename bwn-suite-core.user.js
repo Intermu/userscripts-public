@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.18
+// @version      1.66.19
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -79,6 +79,25 @@
         sessionStorage.setItem('bwn:wo:' + id, JSON.stringify(data));
         document.dispatchEvent(new CustomEvent('bwn:update', { detail: { id: id } }));
       } catch (e) { /* storage full or blocked: bus is best-effort */ }
+    }
+    // MERGE a partial payload over whatever is already on the bus, instead of replacing it.
+    // For publishing header identity before the full WO state is computable: a consumer that
+    // reads early gets the real Tracking # rather than nothing, and a later full busPut still
+    // overwrites everything. BLANKS ARE SKIPPED - a field the header has not rendered yet must
+    // never clobber a good value from an earlier pass. Clearing a field is the full publish's
+    // job, since only it knows the difference between "not read yet" and "genuinely empty".
+    function busPatch(id, data) {
+      try {
+        var cur = null;
+        try { var raw = sessionStorage.getItem('bwn:wo:' + id); cur = raw ? JSON.parse(raw) : null; } catch (e) { cur = null; }
+        if (!cur || typeof cur !== 'object' || cur.v !== 1) cur = {};
+        for (var k in data) {
+          if (!Object.prototype.hasOwnProperty.call(data, k)) continue;
+          if (data[k] === '' || data[k] == null) continue;
+          cur[k] = data[k];
+        }
+        busPut(id, cur);
+      } catch (e) { /* bus is best-effort */ }
     }
     function busHeatGet(id, maxAgeMs) {
       try {
@@ -668,7 +687,7 @@
 
     return {
       VERSION: VERSION,
-      woId: woId, busGet: busGet, busPut: busPut, busHeatGet: busHeatGet, busVendors: busVendors,
+      woId: woId, busGet: busGet, busPut: busPut, busPatch: busPatch, busHeatGet: busHeatGet, busVendors: busVendors,
       CFG_DEFAULTS: CFG_DEFAULTS, cfg: cfg, cfgSave: cfgSave,
       money: money, parseMoney: parseMoney, parseBare: parseBare, parseUSDate: parseUSDate,
       alphaOnly: alphaOnly, lcsLen: lcsLen,
@@ -1136,6 +1155,7 @@
     // WO Assist is the PRODUCER of bwn:wo:{id}; others consume DOM-first, bus-fallback.
     var currentWOId = BWN.woId;
     var busPut = BWN.busPut;
+    var busPatch = BWN.busPatch;
     var busHeatGet = BWN.busHeatGet;
 
     // ---- PO rows: vendor, amount, scheduled date, state --------------------
@@ -4550,6 +4570,28 @@
         BWN.beat('woAssist', 'waiting', 'not a WO page');
         return;
       }
+      // ---- Identity publishes FIRST, ahead of the anchor gate below --------------------------
+      // The gate waits for a PO accordion or a rendered note summary before anything is
+      // published. A WO in Pending Dispatch has no POs at all, and a brand-new one has no notes
+      // either for the first seconds of its life (W-383441: created 14:55:59, first note
+      // +11s). A tab loaded inside that window satisfies neither anchor and then never
+      // publishes, because republishing is event-driven rather than on a timer (measured
+      // 2026-08-03: gaps of 18.0s then 1.0s) and sessionStorage is per-tab. That is how the
+      // dispatch modal read an empty bus and sent the WO number as the Tracking # on queue row
+      // 466. Header identity does not depend on POs or notes, so it must not wait for them.
+      // Computed state (GP, POs, next actions) still publishes below and merges over this.
+      // busPatch skips blanks, so a not-yet-rendered field never clobbers a good earlier value;
+      // the full publish below stays authoritative and does write blanks.
+      var hd = headerInfo();
+      var woIdent = currentWOId();
+      if (woIdent && (hd.tracking || hd.wo)) {
+        busPatch(woIdent, {
+          tracking: hd.tracking, wo: hd.wo, location: hd.location,
+          client: hd.client || '', addr: hd.addr || '',
+          coordinator: hd.coordinator || '', sourceJob: hd.sourceJob || '', sourcePo: hd.sourcePo || '',
+          priority: hd.priority || '', trade: hd.trade || ''
+        });
+      }
       if (!document.querySelector('[data-testid^="POAccordion-"]') &&
           !document.querySelector('[data-testid^="wo-note-"][data-testid$="-summary"]')) {
         var p2 = document.getElementById(PILL_ID); if (p2) p2.remove();
@@ -4576,10 +4618,13 @@
       maybeAutoECD(st);
       maybePreflight(st);
       BWN.beat('woAssist', 'ok', 'pill active');
-      // Publish the canonical WO state for the rest of the suite.
+      // Publish the canonical WO state for the rest of the suite. This one REPLACES: it carries
+      // every identity field as well, so it stays authoritative over the early patch above -
+      // including writing a field back to blank when the header genuinely clears it. `hd` is the
+      // same read taken before the gate; re-reading it here would only cost another full label
+      // sweep of the DOM.
       var woId = currentWOId();
       if (woId) {
-        var hd = headerInfo();
         busPut(woId, {
           tracking: hd.tracking, wo: hd.wo, location: hd.location,
           client: hd.client || '', addr: hd.addr || '',
