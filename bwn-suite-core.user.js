@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.17
+// @version      1.66.18
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -44,7 +44,7 @@
   try { localStorage.setItem('bwn:status:core', JSON.stringify({ ver: BWN_VER, ts: Date.now() })); } catch (e) { /* best-effort */ }
 
   console.info('[BWN SUITE CORE] v' + BWN_VER + ' |',
-    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.65 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.16 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
+    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.66 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.16 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
     'enabled:', Object.keys(BWN_MODULES).filter(function (k) { return BWN_MODULES[k]; }).join(', '));
 
   // ===== BWN SHARED CORE v7 - KEEP IN SYNC across both suite scripts =====
@@ -1091,7 +1091,7 @@
   });
 
   // ==========================================================================
-  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.65 (Connector 1.2)
+  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.66 (Connector 1.2)
   // ==========================================================================
   if (BWN_MODULES.woAssist) BWN.safeModule('woAssist', function () {
     'use strict';
@@ -1121,7 +1121,7 @@
     var PANEL_ID = 'bwn-gp-panel';
     var GREEN = BWN.GREEN;
 
-    console.info('[BWN GP] WO Assist v2.65 loaded on', location.href);
+    console.info('[BWN GP] WO Assist v2.66 loaded on', location.href);
 
     // ---- Parsing helpers (shared via BWN core) -----------------------------
     var parseMoney = BWN.parseMoney;
@@ -1970,6 +1970,8 @@
         '.bwn-act-anchor{background:var(--bwn-surface-2);border-bottom:none;border-radius:8px;margin-top:3px;}' +
         '.bwn-act-anchor .bwn-act-lbl{font-style:italic;color:var(--bwn-text-faint);}' +
         '.bwn-act-anchor-mk{flex:none;width:15px;text-align:center;color:var(--bwn-warn);margin-top:1px;font-size:13px;}' +
+        '.bwn-act-esc{padding:7px 12px;font:500 11.5px ui-monospace,"Segoe UI Mono","SF Mono",monospace;background:var(--bwn-warn-bg);color:var(--bwn-warn-fg);border-top:1px solid var(--bwn-border-2);line-height:1.4;}' +
+        '.bwn-act-esc:last-child{border-radius:0 0 9px 9px;}' +
         '.bwn-actc{display:block;width:100%;align-self:stretch;box-sizing:border-box;margin:6px 0 14px;border:1px solid var(--bwn-border);border-left:3px solid var(--bwn-green);border-radius:10px;background:var(--bwn-surface);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;box-shadow:0 1px 4px rgba(13,38,26,.06);}' +
         '.bwn-actc-hd{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;user-select:none;}' +
         '.bwn-actc-hd:focus-visible{outline:2px solid var(--bwn-accent);outline-offset:-2px;}' +
@@ -3499,6 +3501,61 @@
       try { document.dispatchEvent(new CustomEvent('bwn:evt', { detail: { id: 'bwn:assist:due', escSev: a.sev } })); } catch (e) { }
     }
 
+    // ASSIST STATE ROUND-TRIP (queue-spec step 3). The queue's lifecycle lives on the
+    // server and Core is @grant none, so it cannot ask. bwn-wo-assist (which can) queries
+    // op:'status' and publishes the current WO's ACTIVE escalation two ways: a
+    // bwn:assist:state bus event (live re-render) and sessionStorage
+    // bwn:assist:state:<woId> (render-time reads after a reload). Core only CONSUMES -
+    // the same one-way pattern as bwn:role. Render-layer only: the pure engine never
+    // sees any of it, so engine output stays byte-identical.
+    var WA_ESC_TTL_MS = 30 * 60000;   // assist refreshes ~5-minutely; a dead install ages out
+    var waAssistState = {};
+    document.addEventListener('bwn:evt', function (e) {
+      var d = e && e.detail;
+      if (d && d.id === 'bwn:assist:state' && d.wo) waAssistState[d.wo] = { v: 1, ts: Date.now(), found: !!d.found, record: d.record || null };
+    }, false);
+    // The current WO's active escalation record, or null. Only open/ack count - a
+    // resolved item must clear the strip the moment anyone resolves it, and stale
+    // published state ages out rather than lying forever.
+    function waEscState() {
+      var m = location.pathname.match(/work-orders\/(\d+)/);
+      if (!m) return null;
+      var s = waAssistState[m[1]];
+      if (!s) {
+        s = BWN.ssGetJSON('bwn:assist:state:' + m[1], null);
+        if (!s || s.v !== 1) return null;
+      }
+      if (!s.found || !s.record) return null;
+      if (!s.ts || (Date.now() - s.ts) > WA_ESC_TTL_MS) return null;
+      var st = s.record.status;
+      return (st === 'open' || st === 'ack') ? s.record : null;
+    }
+    // Strip wording, pure. "Escalated - awaiting mgmt" is the queue-spec's literal
+    // round-trip phrase; ack and own-call get their own honest variants.
+    function waEscStripText(rec) {
+      function md(iso) { var d = new Date(iso); return isNaN(+d) ? '' : ((d.getMonth() + 1) + '/' + d.getDate()); }
+      function nm(s) { s = String(s || ''); var i = s.indexOf('@'); return i > 0 ? s.slice(0, i) : s; }
+      if (!rec) return '';
+      var p;
+      if (rec.status === 'ack') {
+        p = ['Escalated - mgmt has it (acknowledged' + (nm(rec.assignee) ? ' by ' + nm(rec.assignee) : '') + (md(rec.ackAt) ? ' ' + md(rec.ackAt) : '') + ')'];
+      } else if (rec.tier === 'own-call') {
+        p = ['Escalation recorded - own call, yours to decide'];
+      } else {
+        p = ['Escalated - awaiting mgmt'];
+        if (nm(rec.requester)) p.push('by ' + nm(rec.requester));
+      }
+      if (md(rec.openedAt)) p.push('opened ' + md(rec.openedAt));
+      if (rec.status !== 'ack' && md(rec.dueAt)) p.push('due ' + md(rec.dueAt));
+      return p.join(' · ');
+    }
+    // Tool-button label: an already-escalated WO's assist button opens the SAME drawer,
+    // which shows the ack/resolve panel instead of a form the server would dedup-refuse
+    // anyway - so say what it does.
+    function waEscToolLabel(dk, esc) {
+      return (dk === 'assist' && esc) ? 'View escalation…' : (ACT_TOOL_LABEL[dk] || 'Open tool…');
+    }
+
     // IN-PAGE NAVIGATION. Clicking a step label walks the page to the thing it is about.
     // Only targets with a PROVEN selector are offered (the same ones the engine already
     // reads): PO rows by their own testid, the ECD picker, the DNE/NTE input. Anything
@@ -3590,9 +3647,13 @@
       var realOpen = acts.filter(function (a) { return !a.anchor && !(store[a.key] && store[a.key].done); }).length;
       var collapsed = false;
       try { collapsed = localStorage.getItem('bwn:acts:collapsed') === '1'; } catch (e) { }
+      // Live escalation state (render-layer only; see waEscState). Part of the signature
+      // so the strip appears, flips and clears the moment the assist script publishes.
+      var escSt = null;
+      try { escSt = waEscState(); } catch (e) { }
       // Signature gate: rebuild only when content or placement actually changed, so
       // the steady-state refresh loop never re-renders the card under the cursor.
-      var sig = JSON.stringify([collapsed, acts.map(function (a) {
+      var sig = JSON.stringify([collapsed, escSt ? escSt.status + '|' + escSt.id + '|' + (escSt.ackAt || '') : '', acts.map(function (a) {
         var r = store[a.key];
         // Phase 2 additions to the signature: a tool button appearing when its registrant
         // comes online (or vanishing when it drops) and a help block toggling are both
@@ -3638,6 +3699,17 @@
       hd.addEventListener('click', toggleCollapse);
       hd.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleCollapse(); } });
       card.appendChild(hd);
+
+      // The round-trip strip: "Escalated - awaiting mgmt" while the queue holds an
+      // ACTIVE item for this WO. Deliberately outside the collapsed gate - an open
+      // escalation is exactly what a one-line glance is for.
+      if (escSt) {
+        var esb = document.createElement('div');
+        esb.className = 'bwn-act-esc';
+        esb.textContent = '🚩 ' + waEscStripText(escSt);
+        esb.title = 'Live from the assist queue' + (escSt.requester ? ' · requested by ' + escSt.requester : '') + (escSt.reason ? ' · ' + escSt.reason : '') + ' · acknowledge or resolve from the Escalate drawer or the dashboard';
+        card.appendChild(esb);
+      }
 
       if (!collapsed) {
         var body = document.createElement('div'); body.className = 'bwn-actc-body';
@@ -3752,9 +3824,11 @@
             tool.docks.forEach(function (dk) {
               if (!waDockAlive(dk)) return;
               var tb = document.createElement('button');
-              tb.type = 'button'; tb.className = 'bwn-wa-btn ghost'; tb.textContent = ACT_TOOL_LABEL[dk] || 'Open tool…';
+              tb.type = 'button'; tb.className = 'bwn-wa-btn ghost'; tb.textContent = waEscToolLabel(dk, escSt);
               tb.style.cssText = 'padding:3px 9px;font-size:10px;';
-              tb.title = 'Open the ' + (ACT_TOOL_LABEL[dk] || 'tool').replace(/…$/, '') + ' drawer for this work order';
+              tb.title = (dk === 'assist' && escSt)
+                ? 'An escalation is already open on this work order - view, acknowledge or resolve it'
+                : 'Open the ' + (ACT_TOOL_LABEL[dk] || 'tool').replace(/…$/, '') + ' drawer for this work order';
               tb.addEventListener('click', function () {
                 try { document.dispatchEvent(new CustomEvent('bwn:evt', { detail: { id: 'bwn:dock:open', key: dk } })); } catch (e) { }
               });

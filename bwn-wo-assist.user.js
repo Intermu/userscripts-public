@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         BWN WO Assist (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.1.0
+// @version      0.2.0
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-wo-assist.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-wo-assist.user.js
-// @description  Escalate a work order to management from inside Umbrava. Pick why and say what you need; it POSTs to the broadway-internal-ops SWA proxy (x-bwn-key gated) which proves your Umbrava session token, injects your verified email as the requester, works out WHO it goes to from your rank (a coordinator escalates to a supervisor, a supervisor to management, a director owns the call), sets a due clock scaled by the job's priority, records the item in the shared assist queue, and only then sends the notify. Escalating the same work order twice while the first is still open is rejected server-side, so two tabs cannot double-fire. Registers one "Escalate" entry in the shared dock tab and adds an Escalate button to the WO Assist checklist's escalation step; a Tampermonkey menu item opens it too, so it is never stranded. The flow's secret URL stays server-side; nothing sensitive lives in this script.
+// @description  Escalate a work order to management from inside Umbrava, and round-trip its state back onto the page. Pick why and say what you need; it POSTs to the broadway-internal-ops SWA proxy (x-bwn-key gated) which proves your Umbrava session token, injects your verified email as the requester, works out WHO it goes to from your rank (a coordinator escalates to a supervisor, a supervisor to management, a director owns the call), sets a due clock scaled by the job's priority, records the item in the shared assist queue, and only then sends the notify. Escalating the same work order twice while the first is still open is rejected server-side, so two tabs cannot double-fire. While an escalation is open, this script also reads its state back (op:'status') and publishes it on the suite bus, so the WO Assist checklist shows "Escalated - awaiting mgmt" and the drawer becomes an acknowledge/resolve panel instead of a duplicate form. Registers one "Escalate" entry in the shared dock tab and adds an Escalate button to the WO Assist checklist's escalation step; a Tampermonkey menu item opens it too, so it is never stranded. The flow's secret URL stays server-side; nothing sensitive lives in this script.
 // @match        https://app.umbrava.com/*
 // @run-at       document-idle
 // @noframes
@@ -18,12 +18,12 @@
 (function () {
   'use strict';
 
-  var VER = '0.1.0';
+  var VER = '0.2.0';
   var FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Arial,sans-serif";
   var SWA_BASE = 'https://green-stone-0717dab0f.7.azurestaticapps.net';
   var PROXY_URL = SWA_BASE + '/api/wo-assist';
   var GREEN = '#0d3d26';
-  console.info('[BWN WO ASSIST] v' + VER + ' - escalation modal -> SWA proxy (server vouches you, derives tier/recipient/due, records then notifies); registers the Escalate launcher into the shared dock (bwn:dock:*)');
+  console.info('[BWN WO ASSIST] v' + VER + ' - escalation modal -> SWA proxy (server vouches you, derives tier/recipient/due, records then notifies); round-trips queue state onto the checklist (bwn:assist:state) with an ack/resolve panel; registers the Escalate launcher into the shared dock (bwn:dock:*)');
 
   // The canonical reason set. It MUST match VALID_REASONS in api/wo-assist - the server rejects
   // anything else, so the dashboard can group on a known vocabulary instead of free text.
@@ -117,7 +117,9 @@
   var _pendingSource = 'button';
   document.addEventListener('bwn:evt', function (e) {
     var d = e && e.detail; if (!d) return;
-    if (d.id === 'bwn:dock:host' || d.id === 'bwn:dock:ping') dockRegister();
+    // The host ping doubles as the state-refresh tick: queryState is TTL-cached per WO,
+    // so this re-queries only on an SPA nav to a different WO or every ~5 minutes.
+    if (d.id === 'bwn:dock:host' || d.id === 'bwn:dock:ping') { dockRegister(); queryState(woIdFromUrl()); }
     if (d.id === 'bwn:dock:open' && d.key === DOCK_KEY) openAssist();
     // Another tool took the drawer slot - close ours (a half-typed reason is dropped, same
     // as Escape). Matches every other drawer in the suite.
@@ -146,10 +148,102 @@
     } catch (e) { }
   }
 
+  // ---- Assist state round-trip (queue-spec step 3) ---------------------------
+  // The WO Assist checklist (bwn-suite-core, @grant none) cannot ask the server
+  // anything, so THIS script owns the read side: query the queue for the current
+  // WO's ACTIVE escalation (op:'status') and publish it two ways - sessionStorage
+  // bwn:assist:state:<woId> for render-time reads, plus a bwn:assist:state bus
+  // event for live re-render. Core renders "Escalated - awaiting mgmt" from it and
+  // relabels the checklist button; this drawer renders the ack/resolve panel.
+  // Freshness: re-queried when the WO changes or every 5 minutes (dock ping tick),
+  // forced on drawer open and after every submit or verb - so a dashboard-side
+  // resolve clears the strip within minutes, never sessions.
+  var SS_STATE = 'bwn:assist:state:';
+  var QUERY_TTL_MS = 5 * 60000;
+  var _lastQ = { wo: null, ts: 0 };
+  function publishState(woId, found, record) {
+    if (!woId) return;
+    try { sessionStorage.setItem(SS_STATE + woId, JSON.stringify({ v: 1, ts: Date.now(), found: !!found, record: record || null })); } catch (e) { }
+    try { document.dispatchEvent(new CustomEvent('bwn:evt', { detail: { id: 'bwn:assist:state', wo: woId, found: !!found, record: record || null } })); } catch (e) { }
+  }
+  function queryState(woId, force) {
+    if (!woId) return;
+    var key = GM_getValue('ingest_key', '');
+    if (!key) return;                       // unset key = no read; the drawer nags on open
+    var tok = authToken();
+    if (!tok) return;
+    if (!force && _lastQ.wo === woId && (Date.now() - _lastQ.ts) < QUERY_TTL_MS) return;
+    _lastQ = { wo: woId, ts: Date.now() };
+    gmPost(PROXY_URL, { 'Content-Type': 'application/json', 'x-bwn-key': key }, { op: 'status', userToken: tok, woNumber: woId, client: 'pilot' }, 20000)
+      .then(function (r) {
+        // A route that predates step 3 400s the op: publish NOTHING, so the checklist
+        // simply looks the way it did before the round-trip existed.
+        if (r.json && r.json.ok) publishState(woId, !!r.json.found, r.json.record || null);
+      })
+      .catch(function () { });
+  }
+  // POST a lifecycle verb against a record. applied:false is a SYNC, not an error -
+  // somebody else (usually the dashboard) got there first; re-publish what the server
+  // says and let the open drawer re-render from its own bus listener.
+  function verbPost(op, rec, msg, btns) {
+    var woId = rec.woNumber || woIdFromUrl();
+    var key = GM_getValue('ingest_key', '');
+    if (!key) { msg.textContent = 'Set the SWA ingest key first: Tampermonkey menu -> "Set SWA ingest key".'; return; }
+    var userToken = authToken();
+    if (!userToken) { msg.textContent = 'No usable Umbrava session token right now - reload the tab, then try again.'; return; }
+    msg.textContent = '';
+    btns.forEach(function (b) { b.disabled = true; });
+    gmPost(PROXY_URL, { 'Content-Type': 'application/json', 'x-bwn-key': key }, { op: op, userToken: userToken, id: rec.id, client: 'pilot' }, 30000)
+      .then(function (r) {
+        var j = r.json;
+        if (r.status >= 200 && r.status < 300 && !j) {
+          btns.forEach(function (b) { b.disabled = false; });
+          msg.textContent = 'The escalation route did not answer (the server returned a page, not a result).';
+          return;
+        }
+        if (r.status >= 200 && r.status < 300 && j && j.ok) {
+          var rec2 = j.record || null;
+          var active = rec2 && (rec2.status === 'open' || rec2.status === 'ack');
+          publishState(woId, !!active, active ? rec2 : null);   // the open drawer re-renders off this
+          if (!j.applied) { toast('Already ' + ((rec2 && rec2.status) || 'changed') + ' - view refreshed.', 6000, '#8a5a00'); return; }
+          if (op === 'resolve') { closeModal(); toast('Resolved ✓  This WO can be escalated again if it comes back.', 8000); return; }
+          toast('Acknowledged - marked as being handled.', 7000);
+          return;
+        }
+        btns.forEach(function (b) { b.disabled = false; });
+        var code = (j && j.code) || '';
+        if (r.status === 404) {
+          publishState(woId, false, null);
+          toast('That escalation is no longer in the queue - view refreshed.', 7000, '#8a5a00');
+        } else if (r.status === 400 && j && /woNumber/.test(j.error || '')) {
+          // A route that predates step 3 validates CREATE fields against a verb body and
+          // complains about woNumber - a diagnostic fingerprint worth naming.
+          msg.textContent = 'The escalation server does not know ack/resolve yet (route update not deployed) - tell Mike.';
+        } else if (r.status === 401) {
+          msg.textContent = 'Umbrava could not verify your session (' + (code || '401') + ') - reload the tab and try again.';
+        } else if (r.status === 403) {
+          msg.textContent = 'Rejected (403): the SWA ingest key is missing or wrong. Re-set it via the Tampermonkey menu.';
+        } else if (r.status === 503) {
+          msg.textContent = 'The queue is busy (' + ((j && j.error) || '503') + ') - try again in a moment.';
+        } else {
+          msg.textContent = 'Failed (' + r.status + ')' + (j && j.error ? ': ' + j.error : '') + '.';
+        }
+      })
+      .catch(function (err) {
+        btns.forEach(function (b) { b.disabled = false; });
+        msg.textContent = (err && err.message ? err.message : 'could not reach the proxy') + '.';
+      });
+  }
+
   // ---- Drawer ---------------------------------------------------------------
   var openEl = null;
+  var openStateEvt = null;   // the open drawer's bwn:assist:state listener, removed on close
   function closeModal() {
-    if (openEl) { openEl.remove(); openEl = null; document.removeEventListener('keydown', onKey); }
+    if (openEl) {
+      openEl.remove(); openEl = null;
+      document.removeEventListener('keydown', onKey);
+      if (openStateEvt) { document.removeEventListener('bwn:evt', openStateEvt); openStateEvt = null; }
+    }
   }
   function onKey(e) { if (e.key === 'Escape') closeModal(); }
 
@@ -179,6 +273,23 @@
     x.addEventListener('click', closeModal);
     head.appendChild(x);
 
+    card.appendChild(head);
+
+    // Content area: the escalation FORM, or - when the queue already holds an ACTIVE
+    // item for this WO - the state PANEL (acknowledge/resolve). Swapped live: the
+    // drawer listens for bwn:assist:state while open, so a verb, a background refresh,
+    // or a dashboard-side flip re-renders it in place.
+    var content = null;
+    function setContent(node) { if (content) content.remove(); content = node; card.appendChild(node); }
+    function activeRec(d) { return (d && d.found && d.record && (d.record.status === 'open' || d.record.status === 'ack')) ? d.record : null; }
+    function renderContent(rec) { setContent(rec ? buildPanel(rec) : buildForm()); }
+    openStateEvt = function (e) {
+      var d = e && e.detail;
+      if (d && d.id === 'bwn:assist:state' && d.wo === woId && openEl === back) renderContent(activeRec(d));
+    };
+    document.addEventListener('bwn:evt', openStateEvt);
+
+    function buildForm() {
     var form = document.createElement('form');
     form.className = 'bwn-drawer-body';
     form.setAttribute('autocomplete', 'off');
@@ -277,8 +388,24 @@
           if (r.status >= 200 && r.status < 300 && j && j.ok) {
             closeModal();
             if (j.duplicate) {
+              // The queue already holds the open item - publish what the response carries
+              // (requester unknown here), then force a status read to backfill the rest.
+              publishState(woId, true, { id: j.id, kind: 'mgmt-assist', woNumber: woId, requester: '', tier: j.tier || '', recipient: j.recipient || '', reason: '', ask: '', status: j.status || 'open', openedAt: j.openedAt || '', dueAt: j.dueAt || '', ackAt: '', assignee: '' });
+              queryState(woId, true);
               toast('Already escalated and still open - nobody was notified twice. Opened ' + shortWhen(j.openedAt) + '.', 8000, '#8a5a00');
-            } else if (j.tier === 'own-call') {
+              return;
+            }
+            // A fresh record: synthesize the published state from the response + the form
+            // (that IS the record the server just wrote), so the checklist strip appears
+            // immediately without a second round trip.
+            publishState(woId, true, {
+              id: j.id, kind: 'mgmt-assist', woNumber: woId, requester: me.email || '',
+              tier: j.tier || '', recipient: j.recipient || '', reason: reason, ask: ask,
+              status: 'open', openedAt: j.openedAt || new Date().toISOString(),
+              dueAt: j.dueAt || '', ackAt: '', assignee: ''
+            });
+            _lastQ = { wo: woId, ts: Date.now() };
+            if (j.tier === 'own-call') {
               toast('Recorded - but there is nobody above you to escalate to, so this one is yours to decide. It is in the queue.', 9000, '#8a5a00');
             } else if (j.notified === false) {
               toast('Escalation recorded, but the notify did not send. It is in the queue - follow up directly.', 9000, '#8a5a00');
@@ -294,8 +421,14 @@
           } else if (r.status === 429) {
             reenable(); msg.textContent = 'Too many submissions in a row - wait a moment and try again.';
           } else if (r.status === 502 && j && j.recorded) {
-            // The record IS durable; only the notify failed. Do not invite a resubmit.
+            // The record IS durable; only the notify failed. Do not invite a resubmit -
+            // and publish the state, because the queue really does hold an open item now.
             closeModal();
+            publishState(woId, true, {
+              id: j.id, kind: 'mgmt-assist', woNumber: woId, requester: me.email || '',
+              tier: j.tier || '', recipient: '', reason: reason, ask: ask, status: 'open',
+              openedAt: j.openedAt || new Date().toISOString(), dueAt: j.dueAt || '', ackAt: '', assignee: ''
+            });
             toast('Escalation recorded, but the notify could not be sent. It is in the queue - follow up directly.', 9000, '#8a5a00');
           } else if (r.status === 503) {
             reenable(); msg.textContent = 'Escalation is not switched on yet' + (j && j.error ? ' (' + j.error + ')' : '') + ' - tell Mike.';
@@ -308,12 +441,83 @@
         });
     });
 
-    card.appendChild(head); card.appendChild(form);
+    setTimeout(function () { try { sel.focus(); } catch (e2) { } }, 30);
+    return form;
+    }
+
+    // The state panel: what is already escalated, who has it, and the two verbs. Shown
+    // instead of the form whenever the queue holds an ACTIVE item - the server would
+    // dedup-refuse a second submit anyway, so offer the truth and the next moves.
+    function buildPanel(rec) {
+      var box = document.createElement('div');
+      box.className = 'bwn-drawer-body';
+
+      var note = document.createElement('div');
+      note.style.cssText = 'font-size:12.5px;color:#7a4d00;background:#fdf3e2;border:1px solid #ecd9b0;border-radius:8px;padding:8px 11px;margin-bottom:14px;line-height:1.45;';
+      note.textContent = rec.status === 'ack'
+        ? 'This work order is escalated and management has acknowledged it.'
+        : 'This work order already has an open escalation - nobody gets notified twice while it is open.';
+      box.appendChild(note);
+
+      var lines = [];
+      lines.push('WO ' + (rec.woNumber || woId));
+      if (rec.requester) lines.push('Escalated by ' + rec.requester);
+      lines.push('Opened ' + shortWhen(rec.openedAt) + (rec.dueAt ? ' · due ' + shortWhen(rec.dueAt) : ''));
+      if (rec.tier) lines.push('Routed to: ' + rec.tier + (rec.recipient ? ' (' + rec.recipient + ')' : ''));
+      if (rec.reason) lines.push('Reason: ' + rec.reason);
+      if (rec.status === 'ack') lines.push('Acknowledged by ' + (rec.assignee || 'management') + (rec.ackAt ? ' ' + shortWhen(rec.ackAt) : ''));
+      var ctx = document.createElement('div');
+      ctx.style.cssText = 'font:500 11.5px ui-monospace,"Segoe UI Mono","SF Mono",monospace;color:#33473d;background:#f6f9f7;border:1px solid #dbe7e1;border-radius:8px;padding:8px 11px;margin-bottom:13px;line-height:1.55;white-space:pre-line;';
+      ctx.textContent = lines.join('\n');
+      box.appendChild(ctx);
+
+      if (rec.ask) {
+        var lblQ = document.createElement('div');
+        lblQ.style.cssText = 'font-weight:600;font-size:12px;margin:0 0 4px;color:#33473d;';
+        lblQ.textContent = 'What they asked for';
+        var askEl = document.createElement('div');
+        askEl.style.cssText = 'font-size:13px;color:#12241b;background:#fff;border:1px solid #c6d2cc;border-radius:8px;padding:9px 11px;margin-bottom:13px;line-height:1.5;max-height:180px;overflow:auto;white-space:pre-wrap;';
+        askEl.textContent = rec.ask;
+        box.appendChild(lblQ); box.appendChild(askEl);
+      }
+
+      var msg = document.createElement('div');
+      msg.style.cssText = 'font-size:12.5px;color:#8a1c1c;margin:2px 0 10px;line-height:1.45;min-height:1em;';
+      box.appendChild(msg);
+
+      var foot = document.createElement('div');
+      foot.className = 'bwn-drawer-ft';
+      var btns = [];
+      function mkBtn(label, ghost) {
+        var b = document.createElement('button');
+        b.type = 'button'; b.textContent = label;
+        b.style.cssText = ghost
+          ? 'padding:9px 16px;border:1px solid #c6d2cc;border-radius:8px;background:#fff;color:' + GREEN + ';font:600 13px ' + FONT + ';cursor:pointer;'
+          : 'padding:9px 16px;border:none;border-radius:8px;background:' + GREEN + ';color:#fff;font:600 13px ' + FONT + ';cursor:pointer;';
+        btns.push(b); foot.appendChild(b); return b;
+      }
+      if (rec.status === 'open') {
+        mkBtn('Mgmt has it - acknowledge', true).addEventListener('click', function () { verbPost('ack', rec, msg, btns); });
+      }
+      mkBtn('Mark resolved', false).addEventListener('click', function () { verbPost('resolve', rec, msg, btns); });
+      box.appendChild(foot);
+      return box;
+    }
+
+    // Decide from the last published state (fresh enough for UI - the server still
+    // gates), then force a re-query; if anything changed, openStateEvt re-renders.
+    var cached = null;
+    try {
+      var c0 = JSON.parse(sessionStorage.getItem(SS_STATE + woId) || 'null');
+      if (c0 && c0.v === 1) cached = activeRec(c0);
+    } catch (e) { }
+    renderContent(cached);
+    queryState(woId, true);
+
     back.appendChild(card);
     document.body.appendChild(back);
     openEl = back;
     document.addEventListener('keydown', onKey);
-    setTimeout(function () { sel.focus(); }, 30);
   }
 
   function shortWhen(iso) {
@@ -334,4 +538,5 @@
   } catch (e) { }
 
   dockRegister();
+  queryState(woIdFromUrl());   // page may load straight onto a WO; the ping tick keeps it fresh after
 })();
