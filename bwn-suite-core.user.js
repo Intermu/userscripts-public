@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.22
+// @version      1.66.23
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -5338,7 +5338,7 @@
   });
 
   // ==========================================================================
-  // MODULE: WO List Heat v3.17
+  // MODULE: WO List Heat v3.18
   // ==========================================================================
   if (BWN_MODULES.listHeat) BWN.safeModule('listHeat', function () {
     'use strict';
@@ -5349,7 +5349,7 @@
     }
     window.__bwnWoHeat = true;
 
-    console.info('[BWN HEAT] v3.17 loaded on', location.href);
+    console.info('[BWN HEAT] v3.18 loaded on', location.href);
 
     // ---- Config (edit here) ----------------------------------------------
     // Advanced knobs (status-class regexes + priority multipliers) now live in the
@@ -5381,8 +5381,9 @@
     //   - Everything degrades to the scroll Scan All: no capture, a throw, a wrong
     //     total, or a low-confidence row map all fall back and warn - never a silent
     //     partial board.
-    var apiList = null;   // captured shape: { query, variables, path[], conn, ts, sample }
+    var apiList = null;   // captured shape: { query, variables, path[], conn, ts, sample, proven }
     var apiCapTs = 0;
+    var heatApiTotal = null;   // list total read off the API container (rowCount) - see umbravaTotal()
     var heatReplaying = false;   // true during our own API scan - so the hook never captures our replay pages as a "new" query
 
     // ---- Auto API scan (v3.17) -------------------------------------------------------
@@ -5410,6 +5411,73 @@
         Object.keys(vars || {}).forEach(function (k) { if (!PAGING.test(k)) c[k] = vars[k]; });
         return JSON.stringify(c);
       } catch (e) { return null; }
+    }
+
+    // ---- Paging-argument discovery (v3.18) -------------------------------------------
+    // Umbrava's board query takes `page: PageInput!` - an OBJECT, {skip, take} - not the
+    // flat first/after/skip shape the original replay assumed. Measured against the live
+    // board on 2026-08-04: writing `page: 1` makes the server reject the entire call
+    // ("Variable \"$page\" got invalid value 1; Expected type \"PageInput\" to be an
+    // object"), so EVERY API scan threw and fell back to the scroll sweep. Discovery now
+    // looks INSIDE object-valued variables first and never coerces one to a number.
+    // Returns null when nothing pages, else
+    //   { host, nested, size, skip, page, cursor, pageSize }
+    // where `host` is the variable holding the paging keys when nested.
+    var PG_SIZE = /^(take|limit|first|pagesize|size|perpage|pagelength)$/i;
+    var PG_SKIP = /^(skip|offset|start|from)$/i;
+    var PG_PAGE = /^(page|pagenumber|pageindex|pagenum)$/i;
+    var PG_CURSOR = /^(after|cursor)$/i;
+    function heatPagingVars(vars) {
+      var v = vars || {}, ks = Object.keys(v), i, j;
+      for (i = 0; i < ks.length; i++) {                     // 1. nested paging object
+        var val = v[ks[i]];
+        if (!val || typeof val !== 'object' || Array.isArray(val)) continue;
+        var sub = Object.keys(val), n = { host: ks[i], nested: true, size: null, skip: null, page: null, cursor: null, pageSize: 0 };
+        for (j = 0; j < sub.length; j++) {
+          if (n.size === null && PG_SIZE.test(sub[j])) n.size = sub[j];
+          else if (n.skip === null && PG_SKIP.test(sub[j])) n.skip = sub[j];
+          else if (n.page === null && PG_PAGE.test(sub[j])) n.page = sub[j];
+          else if (n.cursor === null && PG_CURSOR.test(sub[j])) n.cursor = sub[j];
+        }
+        if (n.size !== null || n.skip !== null || n.page !== null || n.cursor !== null) {
+          n.pageSize = n.size ? (Number(val[n.size]) || 0) : 0;
+          return n;
+        }
+      }
+      var f = { host: null, nested: false, size: null, skip: null, page: null, cursor: null, pageSize: 0 };
+      for (i = 0; i < ks.length; i++) {                     // 2. flat paging args
+        var raw = v[ks[i]];
+        if (raw && typeof raw === 'object') continue;        // never coerce an object arg
+        if (f.size === null && PG_SIZE.test(ks[i])) f.size = ks[i];
+        else if (f.cursor === null && PG_CURSOR.test(ks[i])) f.cursor = ks[i];
+        else if (f.skip === null && PG_SKIP.test(ks[i])) f.skip = ks[i];
+        else if (f.page === null && PG_PAGE.test(ks[i])) f.page = ks[i];
+      }
+      if (f.size === null && f.cursor === null && f.skip === null && f.page === null) return null;
+      f.pageSize = f.size ? (Number(v[f.size]) || 0) : 0;
+      return f;
+    }
+    // Coverage denominator straight off the list container. The DOM badge read is not
+    // always reachable (the live list logged "list badge total: not found" on 2026-08-04),
+    // and rowCount is the server's own answer for the SAME filters we replayed.
+    function heatContainerTotal(c) {
+      if (!c || typeof c !== 'object') return null;
+      var ks = ['rowCount', 'totalCount', 'totalRecords', 'total'];
+      for (var i = 0; i < ks.length; i++) {
+        var v = c[ks[i]];
+        if (typeof v === 'number' && isFinite(v) && v >= 0) return v;
+      }
+      return null;
+    }
+    // Board-shaped from the REQUEST alone: a work-order-named operation that pages.
+    // Used when no response body is readable (the normal case - see heatRecordCapture).
+    function heatQueryIsWOList(body) {
+      if (!body || !body.query) return false;
+      var name = String(body.operationName || '');
+      if (/^(get)?workorder(details|byid)?$/i.test(name)) return false;   // single-WO reads
+      var head = String(body.query).slice(0, 600);
+      if (!/work\s*_?order/i.test(name) && !/work\s*_?order/i.test(head)) return false;
+      return !!heatPagingVars(body.variables);
     }
 
     function heatIsUmbravaToken(tok) {
@@ -5498,12 +5566,19 @@
     // naming differences. Dates → M/D/YYYY strings so BWN.parseUSDate reads them; the
     // rest → the same string shape the DOM path stores, so every downstream consumer
     // (audit, TSV, over-30, snapshot) is unchanged.
+    // `__typename` is dropped at BOTH levels (v3.18). GraphQL adds it to every object,
+    // and g() below takes the FIRST key its regex matches: with __typename kept,
+    // `priority.__typename` beat `priority.label` and `doNotExceed.__typename` beat
+    // `doNotExceed.amount` (measured on the live board 2026-08-04), so the API scan read
+    // the type name as the PRIORITY - and priority scales the status time limits, so
+    // every API-scanned row got the wrong warn/bad thresholds.
     function heatFlatten(row) {
       var flat = {};
       Object.keys(row || {}).forEach(function (k) {
+        if (k === '__typename') return;
         var val = row[k];
         if (val && typeof val === 'object' && !Array.isArray(val)) {
-          Object.keys(val).forEach(function (k2) { if (val[k2] == null || typeof val[k2] !== 'object') flat[k + '.' + k2] = val[k2]; });
+          Object.keys(val).forEach(function (k2) { if (k2 !== '__typename' && (val[k2] == null || typeof val[k2] !== 'object')) flat[k + '.' + k2] = val[k2]; });
         } else if (Array.isArray(val)) {
           if (val.length && val[0] && typeof val[0] === 'object' && 'name' in val[0]) flat[k + '.name'] = val.map(function (x) { return x && x.name; }).filter(Boolean).join(', ');
         } else { flat[k] = val; }
@@ -5520,6 +5595,13 @@
       var flat = heatFlatten(row);
       var keys = Object.keys(flat);
       function g(re) { for (var i = 0; i < keys.length; i++) if (re.test(keys[i])) { var v = flat[keys[i]]; if (v != null && v !== '') return v; } return ''; }
+      // g() returns the first matching KEY, so with one combined pattern the row's field
+      // order decides which synonym wins. Where two synonyms mean different things - a
+      // scheduled/next-onsite date is the heat model's clock, a First Trip Date is not -
+      // gPref tries the patterns in PREFERENCE order instead (v3.18). Umbrava happens to
+      // emit nextOnsiteDate before priority.firstTripDate today; that is luck, not a
+      // contract, and getting it wrong silently moves the "sched date passed" verdict.
+      function gPref(list) { for (var i = 0; i < list.length; i++) { var v = g(list[i]); if (v !== '') return v; } return ''; }
       var numRaw = g(/(^|\.)(workordernumber|number)$/i);
       var num = String(numRaw).replace(/\D/g, '');
       if (!num) return null;
@@ -5532,7 +5614,7 @@
       var days = g(/(^|\.)(age|days|daysopen|daysold|numberofdays)$|agedays/i);
       var created = g(/workorderdate|creationdate|createddate|datecreated|createdon/i);
       var exp = g(/expectedcompletion|completeby|completiondate/i);
-      var sched = g(/scheduleddate|scheduledate|nextonsite|firsttripdate|scheduledstart/i);
+      var sched = gPref([/scheduleddate|scheduledate|nextonsite|scheduledstart/i, /firsttripdate/i]);
       var lastNote = g(/lastnote.*date|lastnotedate|lastactivity|lastnoteon/i);
       var ageStr = '';
       if (days !== '' && !isNaN(parseFloat(String(days).replace(/,/g, '')))) ageStr = String(Math.round(parseFloat(String(days).replace(/,/g, ''))));
@@ -5549,8 +5631,17 @@
       };
     }
 
-    // Record a captured list query, but only if it beats what we already have
-    // (more rows = more likely the real board query, not a sidebar widget).
+    // Record a captured list query. THE REQUEST ALONE IS ENOUGH (v3.18).
+    // v3.15-3.17 only latched when the RESPONSE body could be read, via
+    // `res.clone().json()` in the hook below. Measured on the live board 2026-08-04: the
+    // app aborts its own fetches on teardown, so every clone read of every operation
+    // rejected with AbortError - the board query included. apiList therefore stayed null
+    // forever, which meant no API scan, no auto-scan, and a "Scan All" button that always
+    // ran the slow scroll sweep. That is the whole reason the overlay still demanded a
+    // full scan on arrival. The request body carries the query text and the filters, which
+    // is everything the replay needs; a response, when one does survive, only UPGRADES the
+    // capture with the row path and a sample. The replay validates the shape either way,
+    // so a wrong guess falls back honestly instead of reporting a partial board.
     function heatRecordCapture(reqBody, data) {
       if (heatReplaying) return;   // don't re-capture our own enlarged replay pages
       // (v3.16) The board query only fires on the WO-list route. A WO-details page fires
@@ -5559,10 +5650,18 @@
       // latch (real board content is also required below).
       if (!isListPage()) return;
       try {
-        var found = heatFindWOList(data);
-        if (!found || !found.rows.length) return;
         var body = (typeof reqBody === 'string') ? JSON.parse(reqBody) : reqBody;
         if (!body || !body.query) return;
+        // A response, if we got one, still earns the stronger latch: only accept an
+        // operation whose rows genuinely map to WOs - a real WO number AND at least one
+        // substantive board field (status/prio/client/assignee/age/hrs/dne/dates). A
+        // details-page purchaseOrders read maps its PO `number` into the WO slot but
+        // leaves every board field blank, so that check keeps it from mis-latching.
+        var found = data ? heatFindWOList(data) : null;
+        if (found && !found.rows.length) found = null;
+        var probe = found ? heatApiRowToEntry(found.rows[0]) : null;
+        var pe = probe ? probe.entry : null;
+        var respProves = !!(pe && (pe.status || pe.prio || pe.client || pe.assignee || pe.days || pe.hrs || pe.dne || pe.sched || pe.lastNote || pe.exp));
         // Same query text = the same operation the board already latched, so this is a
         // filter change, not a rival query: refresh the variables (and re-scan) instead of
         // letting the anti-downgrade guard below drop it. Without this, filtering to a
@@ -5572,22 +5671,29 @@
           var sameVars = heatFilterSig(body.variables) === heatFilterSig(apiList.variables);
           apiList.variables = body.variables || {};
           apiCapTs = Date.now();
-          if (!sameVars) apiList._rows = found.rows.length;
+          if (respProves) {
+            apiList.path = found.path; apiList.conn = found.conn;
+            apiList.sample = pe; apiList._rows = found.rows.length; apiList.proven = true;
+          } else if (!sameVars) apiList._rows = 0;
           heatAutoScanSoon(apiList.variables);
           return;
         }
-        if (apiList && found.rows.length < (apiList._rows || 0) && (Date.now() - apiCapTs) < 60000) return;
-        // Only accept an operation whose rows genuinely map to WOs: a real WO number
-        // AND at least one substantive board field (status/prio/client/assignee/age/hrs/
-        // dne/dates). A details-page purchaseOrders read maps its PO `number` into the WO
-        // slot but leaves every board field blank - reject it so it never mis-latches.
-        var probe = heatApiRowToEntry(found.rows[0]);
-        if (!probe) return;
-        var pe = probe.entry;
-        if (!(pe.status || pe.prio || pe.client || pe.assignee || pe.days || pe.hrs || pe.dne || pe.sched || pe.lastNote || pe.exp)) return;
-        apiList = { query: body.query, variables: body.variables || {}, path: found.path, conn: found.conn, _rows: found.rows.length, sample: probe.entry };
+        if (!respProves && !heatQueryIsWOList(body)) return;
+        // Anti-downgrade: a capture the replay has already PROVEN (or one a response
+        // verified) is never displaced by a request-only guess from another operation,
+        // and a fresh request-only latch holds for a minute so two board-shaped
+        // operations on one page cannot fight over the slot every few seconds.
+        if (apiList && !respProves && (apiList.proven || (Date.now() - apiCapTs) < 60000)) return;
+        if (apiList && respProves && apiList.proven && found.rows.length < (apiList._rows || 0) && (Date.now() - apiCapTs) < 60000) return;
+        apiList = {
+          query: body.query, variables: body.variables || {},
+          path: found ? found.path : null, conn: found ? found.conn : false,
+          _rows: found ? found.rows.length : 0, sample: pe || null, proven: respProves
+        };
         apiCapTs = Date.now();
-        console.info('[BWN HEAT] captured list query (' + found.rows.length + ' rows, path ' + found.path.join('.') + (found.conn ? '/' + found.conn : '') + ') - API scan available. Sample:', probe.entry);
+        console.info('[BWN HEAT] captured list query (' + (body.operationName || 'anonymous') + ': ' +
+          (respProves ? found.rows.length + ' rows, path ' + found.path.join('.') + (found.conn ? '/' + found.conn : '')
+            : 'request-only, row path resolved on the first replay page') + ') - API scan available.');
         // A capture is also the moment a filter change lands, so this is the one trigger
         // that keeps the book-wide numbers in step with the list without a click (v3.17).
         heatAutoScanSoon(apiList.variables);
@@ -5607,6 +5713,9 @@
             var body = (init && init.body) || (input && input.body) || null;
             var p = of.apply(this, arguments);
             if (isGqlUrl(url) && body) {
+              // Latch off the REQUEST first (v3.18): the clone read below loses a race with
+              // the app's own teardown almost every time, so it cannot be the only path.
+              try { heatRecordCapture(body, null); } catch (e) { }
               try {
                 p.then(function (res) {
                   try { res.clone().json().then(function (j) { if (j && j.data) heatRecordCapture(body, j.data); }, function () { }); } catch (e) { }
@@ -5624,6 +5733,7 @@
         XMLHttpRequest.prototype.send = function (body) {
           var xhr = this;
           if (isGqlUrl(xhr.__bwnUrl) && body) {
+            try { heatRecordCapture(body, null); } catch (e) { }   // request-time latch (v3.18)
             xhr.addEventListener('load', function () {
               try { var j = JSON.parse(xhr.responseText); if (j && j.data) heatRecordCapture(body, j.data); } catch (e) { }
             });
@@ -5887,6 +5997,10 @@
         }
         v = best;
       }
+      // Last resort: the total the API scan read off the list container. The live list
+      // logged "list badge total: not found" on 2026-08-04, and a scan with no denominator
+      // cannot tell a full board from a partial one.
+      if (v === null && heatApiTotal !== null) v = heatApiTotal;
       totCache = { path: location.pathname, v: v };
       return v;
     }
@@ -5986,6 +6100,7 @@
     // ---- Heat pass ----------------------------------------------------------------
     var heatStore = null;     // { href: {sev, reasons[], wo, client, status, assignee, prio, hrs, days, dne, sched, lastNote, exp} }
     var heatScanning = false;
+    var heatScanAbort = false;   // set by the route-change observer so an in-flight API scan bails cleanly
     var heatScanClean = false;   // true only after a clean Scan All convergence - gates trend/snapshot writes
     var heatScanNote = null;     // WHY the last scan was dirty (shown in the Over-30 confirm so the user isn't guessing)
     var heatFilter = null;    // null | 'bad' | 'warn'  (vestigial: red/amber chips removed; pills filter now)
@@ -6549,7 +6664,7 @@
           if (!ok) { console.info('[BWN HEAT] API scan unavailable/low-confidence - falling back to scroll scan.'); scanAll(btn); }
         }, function (err) {
           console.warn('[BWN HEAT] API scan errored - falling back to scroll scan:', err && err.message || err);
-          heatScanning = false; btn.disabled = false; scanAll(btn);
+          heatScanning = false; heatReplaying = false; btn.disabled = false; scanAll(btn);
         });
       } else {
         scanAll(btn);
@@ -6573,8 +6688,10 @@
       apiScanAll(btn).then(function (ok) {
         if (!ok) console.info('[BWN HEAT] auto API scan was low-confidence - press Scan All for the scroll sweep.');
       }, function (err) {
-        heatScanning = false;
-        try { btn.disabled = false; } catch (e) { }
+        // heatReplaying MUST be cleared here: left true, the net hook ignores every later
+        // request and capture is dead for the rest of the page's life.
+        heatScanning = false; heatReplaying = false; heatStore = null;
+        try { btn.disabled = false; btn.textContent = 'Scan All'; } catch (e) { }
         console.warn('[BWN HEAT] auto API scan errored - press Scan All to sweep manually:', (err && err.message) || err);
       });
     }
@@ -6588,33 +6705,30 @@
     // board (heatStore filled, snapshot written); false to hand off to the scroll scan.
     function apiScanAll(btn) {
       if (!apiList || !apiList.query) return Promise.resolve(false);
-      heatScanning = true; heatScanClean = false; heatStore = {}; heatReplaying = true;
+      heatScanning = true; heatScanClean = false; heatScanAbort = false; heatStore = {}; heatReplaying = true;
       btn.disabled = true; btn.textContent = 'Scanning (API)…';
       var progEl = document.getElementById('bwn-heat-prog');
       var target = umbravaTotal();
       if (progEl) { progEl.style.display = 'block'; progEl.classList.add('indet'); }
 
-      // Discover the size / advance argument names from the captured variables.
+      // Discover the paging argument(s) - nested object (Umbrava's PageInput) or flat.
       var vars0 = apiList.variables || {};
-      function pickKey(names) {
-        var vk = Object.keys(vars0);
-        for (var i = 0; i < names.length; i++) for (var j = 0; j < vk.length; j++) if (vk[j].toLowerCase() === names[i]) return vk[j];
-        return null;
-      }
-      var sizeKey = pickKey(['first', 'limit', 'pagesize', 'take', 'perpage', 'pagelength', 'count']);
-      var cursorKey = pickKey(['after', 'cursor']);
-      var offsetKey = pickKey(['skip', 'offset', 'start']);
-      var pageKey = pickKey(['page', 'pagenumber', 'pageindex']);
+      var pg = heatPagingVars(vars0);
       var PAGE = 200, CAP = 60;
-      var origSize = sizeKey ? Number(vars0[sizeKey]) || 0 : 0;
-      if (sizeKey && origSize && origSize > PAGE) PAGE = Math.min(origSize, 500);
+      if (pg && pg.pageSize > PAGE) PAGE = Math.min(pg.pageSize, 500);
 
-      var seen = {}, pages = 0, badRows = 0, totalRows = 0;
+      var seen = {}, pages = 0, badRows = 0, totalRows = 0, lastHave = 0;
       var vars = JSON.parse(JSON.stringify(vars0));
-      if (sizeKey) vars[sizeKey] = PAGE;
-      if (cursorKey) vars[cursorKey] = null;
-      if (offsetKey) vars[offsetKey] = 0;
-      if (pageKey) vars[pageKey] = (typeof vars0[pageKey] === 'number' && vars0[pageKey] === 0) ? 0 : 1;
+      // Where the paging keys live: inside the captured object for a nested arg, else
+      // alongside the other variables. Writing a NUMBER over a nested object is what the
+      // server rejected outright before v3.18, so the object is edited in place.
+      var pgHost = (pg && pg.nested) ? vars[pg.host] : vars;
+      if (pg && pgHost) {
+        if (pg.size) pgHost[pg.size] = PAGE;
+        if (pg.cursor) pgHost[pg.cursor] = null;
+        if (pg.skip) pgHost[pg.skip] = 0;
+        else if (pg.page) pgHost[pg.page] = (typeof pgHost[pg.page] === 'number' && pgHost[pg.page] === 0) ? 0 : 1;
+      }
 
       function absorb(rows) {
         for (var i = 0; i < rows.length; i++) {
@@ -6645,37 +6759,67 @@
         heatScanning = false; heatReplaying = false; btn.disabled = false; btn.textContent = 'Rescan All';
         if (progEl) { progEl.style.display = 'none'; progEl.classList.remove('indet'); progEl.firstChild.style.width = '0'; }
         heatScanClean = !!clean; heatScanNote = note || null;
-        var n = Object.keys(heatStore).length;
-        console.info('[BWN HEAT] API scan ' + (clean ? 'complete' : 'incomplete') + ':', n, 'WOs in', pages, 'page(s)' + (note ? ' | ' + note : '') + (target != null ? ' | badge total ' + target : ''));
+        var n = heatStore ? Object.keys(heatStore).length : 0;
+        // A dirty API finish drops the store (v3.18). `scanned` in the banner is just
+        // `!!heatStore`, so an empty-but-present store would have the strip announce
+        // "of 0 open - full board" off a scan that actually failed. No store = the strip
+        // falls back to the loaded rows and still says "Scan All for full board".
+        if (!clean) heatStore = null;
+        console.info('[BWN HEAT] API scan ' + (clean ? 'complete' : 'incomplete') + ':', n, 'WOs in', pages, 'page(s)' + (note ? ' | ' + note : '') + (target != null ? ' | list total ' + target : ''));
         woListHeat();
         if (clean) heatSnapshot();
         var pn = document.getElementById(PANEL_ID); if (pn) { pn.remove(); toggleAuditPanel(); }
       }
 
+      // A route change mid-scan nulls heatStore under us; absorbing into it would throw
+      // and leave heatReplaying stuck true, which silently kills capture for the rest of
+      // the page's life. Bail cleanly instead.
+      function aborted() { return heatScanAbort || !heatStore; }
+
       function step() {
+        if (aborted()) { finishApi(false, 'navigated away mid-scan'); return Promise.resolve(false); }
         return heatGql(apiList.query, vars).then(function (data) {
+          if (aborted()) { finishApi(false, 'navigated away mid-scan'); return false; }
           pages++;
-          var found = heatFindWOList(data) || { path: apiList.path, conn: apiList.conn };
-          var rows = heatRowsAtPath(data, found.path ? found : apiList);
+          var found = heatFindWOList(data) || (apiList.path ? { path: apiList.path, conn: apiList.conn } : null);
+          if (!found || !found.path) { finishApi(false, 'could not locate the WO rows in the API response'); return false; }
+          var rows = heatRowsAtPath(data, found);
           if (!rows.length && pages === 1) { finishApi(false, 'first API page returned no rows'); return false; }
           absorb(rows);
           var have = Object.keys(heatStore).length;
+          // The replay proved the shape: remember the row path so a later scan does not
+          // have to rediscover it, and stop treating the capture as a guess.
+          if (have) { apiList.proven = true; apiList.path = found.path; apiList.conn = found.conn; }
+
+          // The server's own count for these filters beats the DOM badge, which is not
+          // always findable on the list header.
+          var container = heatContainerAtPath(data, found);
+          var ct = heatContainerTotal(container);
+          if (ct !== null) { target = ct; heatApiTotal = ct; }
+
           btn.textContent = 'Scanning (API)… ' + have + (target ? '/' + target : '');
           if (progEl && target) { progEl.classList.remove('indet'); progEl.firstChild.style.width = Math.min(100, Math.round(have / target * 100)) + '%'; }
 
-          // Advance. Cursor > offset > page; else single-shot.
-          var container = heatContainerAtPath(data, found.path ? found : apiList);
+          // Advance. Cursor > skip/offset > page number; else single-shot. `room` prefers
+          // the known total, and a page that added nothing new is always a stop - without
+          // that a server which ignores the offset would page forever against the cap.
           var pageInfo = container && container.pageInfo;
-          if (cursorKey && pageInfo) {
-            if (pageInfo.hasNextPage && pageInfo.endCursor && pages < CAP) { vars[cursorKey] = pageInfo.endCursor; return step(); }
+          var grew = have > lastHave;
+          lastHave = have;
+          var room = grew && (target == null ? rows.length > 0 : have < target);
+          if (pg && pg.cursor && pageInfo) {
+            if (pageInfo.hasNextPage && pageInfo.endCursor && pages < CAP) { pgHost[pg.cursor] = pageInfo.endCursor; return step(); }
             return doneCheck();
           }
-          if (offsetKey) {
-            if (rows.length >= PAGE && (target == null || have < target) && pages < CAP) { vars[offsetKey] = (Number(vars[offsetKey]) || 0) + PAGE; return step(); }
+          if (pg && pg.skip) {
+            // Advance by the rows the server ACTUALLY returned, not by the size we asked
+            // for: a server free to cap `take` below our page size (Umbrava honors 200, but
+            // nothing promises that) would otherwise leave a hole between every page.
+            if (rows.length && room && pages < CAP) { pgHost[pg.skip] = (Number(pgHost[pg.skip]) || 0) + rows.length; return step(); }
             return doneCheck();
           }
-          if (pageKey) {
-            if (rows.length >= PAGE && (target == null || have < target) && pages < CAP) { vars[pageKey] = (Number(vars[pageKey]) || 0) + 1; return step(); }
+          if (pg && pg.page) {
+            if (rows.length && room && pages < CAP) { pgHost[pg.page] = (Number(pgHost[pg.page]) || 0) + 1; return step(); }
             return doneCheck();
           }
           // No pagination arg we recognize: the enlarged single call is all we get.
@@ -6688,9 +6832,9 @@
         // Confidence gate: if too many rows failed to map to a real WO, the captured
         // query is the wrong shape for the heat model - hand back to the scroll scan.
         if (totalRows > 0 && badRows / totalRows > 0.5) { finishApi(false, 'row mapping low-confidence (' + badRows + '/' + totalRows + ' unmapped)'); return false; }
-        // Honesty about coverage vs Umbrava's own badge total (same rule the scroll scan uses).
-        if (target != null && have < target * 0.9) { finishApi(false, 'API returned ' + have + ' of ' + target + ' (badge) - likely a filtered/paginated query'); return false; }
-        finishApi(true, target != null && have < target ? 'below badge total ' + target + ' - filtered view accepted as clean' : null);
+        // Honesty about coverage vs the list's own total (same rule the scroll scan uses).
+        if (target != null && have < target * 0.9) { finishApi(false, 'API returned ' + have + ' of ' + target + ' - likely a filtered/paginated query'); return false; }
+        finishApi(true, target != null && have < target ? 'below list total ' + target + ' - filtered view accepted as clean' : null);
         return true;
       }
 
@@ -7028,6 +7172,7 @@
     var obs = new MutationObserver(BWN.guard(function () {
       if (location.pathname !== lastPath) {
         lastPath = location.pathname;
+        if (heatScanning) heatScanAbort = true;   // an in-flight scan must not write into a nulled store
         heatStore = null;
         heatScanClean = false;
         heatFilter = null;
