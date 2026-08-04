@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.21
+// @version      1.66.22
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -44,7 +44,7 @@
   try { localStorage.setItem('bwn:status:core', JSON.stringify({ ver: BWN_VER, ts: Date.now() })); } catch (e) { /* best-effort */ }
 
   console.info('[BWN SUITE CORE] v' + BWN_VER + ' |',
-    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.66 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.16 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
+    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.66 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.17 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
     'enabled:', Object.keys(BWN_MODULES).filter(function (k) { return BWN_MODULES[k]; }).join(', '));
 
   // ===== BWN SHARED CORE v7 - KEEP IN SYNC across both suite scripts =====
@@ -5338,7 +5338,7 @@
   });
 
   // ==========================================================================
-  // MODULE: WO List Heat v3.16
+  // MODULE: WO List Heat v3.17
   // ==========================================================================
   if (BWN_MODULES.listHeat) BWN.safeModule('listHeat', function () {
     'use strict';
@@ -5349,7 +5349,7 @@
     }
     window.__bwnWoHeat = true;
 
-    console.info('[BWN HEAT] v3.16 loaded on', location.href);
+    console.info('[BWN HEAT] v3.17 loaded on', location.href);
 
     // ---- Config (edit here) ----------------------------------------------
     // Advanced knobs (status-class regexes + priority multipliers) now live in the
@@ -5384,6 +5384,33 @@
     var apiList = null;   // captured shape: { query, variables, path[], conn, ts, sample }
     var apiCapTs = 0;
     var heatReplaying = false;   // true during our own API scan - so the hook never captures our replay pages as a "new" query
+
+    // ---- Auto API scan (v3.17) -------------------------------------------------------
+    // The board-wide numbers used to need a Scan All click even when the API scan was
+    // available and instant, so My Day and the audit panel sat on "of N open loaded" -
+    // the viewport - until someone remembered to press it. The capture already tells us
+    // the exact query AND the filters in its variables, so when the API path is available
+    // the scan can just run. Deliberate limits:
+    //   - AUTO NEVER FALLS BACK TO THE SCROLL SCAN. The scroll sweep moves the user's list
+    //     under them; that is fine as a deliberate click, unacceptable unannounced. No
+    //     capture, no token, or a failed replay simply leaves the manual button to do it.
+    //   - One scan per filter set, then a TTL, so paging around the list does not re-scan
+    //     the book every few seconds for every coordinator on the suite.
+    //   - Killable per browser: localStorage['bwn:heat:autoscan'] = '0'.
+    var heatAutoSig = null, heatAutoTs = 0, heatAutoTimer = null;
+    var HEAT_AUTO_TTL = 3 * 60 * 1000;
+    function heatAutoOn() {
+      try { return localStorage.getItem('bwn:heat:autoscan') !== '0'; } catch (e) { return true; }
+    }
+    // Filter identity = the captured variables minus whatever paging key they carry, so a
+    // page/cursor move is not mistaken for a new filter set.
+    function heatFilterSig(vars) {
+      try {
+        var c = {}, PAGING = /^(page|pagenumber|pageindex|first|limit|pagesize|take|perpage|pagelength|count|after|cursor|skip|offset|start)$/i;
+        Object.keys(vars || {}).forEach(function (k) { if (!PAGING.test(k)) c[k] = vars[k]; });
+        return JSON.stringify(c);
+      } catch (e) { return null; }
+    }
 
     function heatIsUmbravaToken(tok) {
       try {
@@ -5534,9 +5561,22 @@
       try {
         var found = heatFindWOList(data);
         if (!found || !found.rows.length) return;
-        if (apiList && found.rows.length < (apiList._rows || 0) && (Date.now() - apiCapTs) < 60000) return;
         var body = (typeof reqBody === 'string') ? JSON.parse(reqBody) : reqBody;
         if (!body || !body.query) return;
+        // Same query text = the same operation the board already latched, so this is a
+        // filter change, not a rival query: refresh the variables (and re-scan) instead of
+        // letting the anti-downgrade guard below drop it. Without this, filtering to a
+        // SMALLER set within 60s left the captured variables stale, so a scan - manual or
+        // auto - replayed the previous filter set (v3.17).
+        if (apiList && body.query === apiList.query) {
+          var sameVars = heatFilterSig(body.variables) === heatFilterSig(apiList.variables);
+          apiList.variables = body.variables || {};
+          apiCapTs = Date.now();
+          if (!sameVars) apiList._rows = found.rows.length;
+          heatAutoScanSoon(apiList.variables);
+          return;
+        }
+        if (apiList && found.rows.length < (apiList._rows || 0) && (Date.now() - apiCapTs) < 60000) return;
         // Only accept an operation whose rows genuinely map to WOs: a real WO number
         // AND at least one substantive board field (status/prio/client/assignee/age/hrs/
         // dne/dates). A details-page purchaseOrders read maps its PO `number` into the WO
@@ -5548,6 +5588,9 @@
         apiList = { query: body.query, variables: body.variables || {}, path: found.path, conn: found.conn, _rows: found.rows.length, sample: probe.entry };
         apiCapTs = Date.now();
         console.info('[BWN HEAT] captured list query (' + found.rows.length + ' rows, path ' + found.path.join('.') + (found.conn ? '/' + found.conn : '') + ') - API scan available. Sample:', probe.entry);
+        // A capture is also the moment a filter change lands, so this is the one trigger
+        // that keeps the book-wide numbers in step with the list without a click (v3.17).
+        heatAutoScanSoon(apiList.variables);
       } catch (e) { /* capture is best-effort */ }
     }
 
@@ -6118,7 +6161,7 @@
         auditBtn.addEventListener('click', toggleAuditPanel);
         sum.appendChild(auditBtn);
         var scanBtn = document.createElement('button');
-        scanBtn.type = 'button'; scanBtn.textContent = 'Scan All';
+        scanBtn.type = 'button'; scanBtn.id = 'bwn-heat-scan'; scanBtn.textContent = 'Scan All';
         scanBtn.title = 'Reads the whole board. Uses the Umbrava API when available (instant, exact); otherwise scrolls the list in converging passes.';
         scanBtn.addEventListener('click', function () { runScan(scanBtn); });
         sum.appendChild(scanBtn);
@@ -6511,6 +6554,33 @@
       } else {
         scanAll(btn);
       }
+    }
+
+    // Auto-run of the API scan only (v3.17). Called when a board query is captured, which
+    // is also exactly when a filter change lands, so the board-wide numbers follow the
+    // filters the same way the list does. Silent on every refusal - this must never nag.
+    function heatAutoScan(vars) {
+      if (!heatAutoOn() || heatScanning || heatReplaying || !isListPage()) return;
+      if (!apiList || !apiList.query || !heatAuthToken()) return;   // manual button still covers these
+      var sig = heatFilterSig(vars || (apiList && apiList.variables));
+      if (sig && sig === heatAutoSig && heatStore && (Date.now() - heatAutoTs) < HEAT_AUTO_TTL) return;
+      heatAutoSig = sig;
+      heatAutoTs = Date.now();
+      // Use the real Scan All button when the strip is up so the user sees "Scanning (API)…"
+      // rather than numbers changing on their own; a bare object keeps apiScanAll happy if
+      // the strip has not rendered yet.
+      var btn = document.getElementById('bwn-heat-scan') || { };
+      apiScanAll(btn).then(function (ok) {
+        if (!ok) console.info('[BWN HEAT] auto API scan was low-confidence - press Scan All for the scroll sweep.');
+      }, function (err) {
+        heatScanning = false;
+        try { btn.disabled = false; } catch (e) { }
+        console.warn('[BWN HEAT] auto API scan errored - press Scan All to sweep manually:', (err && err.message) || err);
+      });
+    }
+    function heatAutoScanSoon(vars) {
+      if (heatAutoTimer) clearTimeout(heatAutoTimer);
+      heatAutoTimer = setTimeout(function () { heatAutoTimer = null; heatAutoScan(vars); }, 700);
     }
 
     // ---- API scan: replay the captured list query across the whole board ------------
