@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.26
+// @version      1.66.28
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
 // @match        https://app.umbrava.com/*
 // @match        https://*.umbrava.com/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        none
 // ==/UserScript==
 
@@ -44,7 +44,7 @@
   try { localStorage.setItem('bwn:status:core', JSON.stringify({ ver: BWN_VER, ts: Date.now() })); } catch (e) { /* best-effort */ }
 
   console.info('[BWN SUITE CORE] v' + BWN_VER + ' |',
-    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.66 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.17 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.4 \u00b7 Connector 1.2 |',
+    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.66 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.21 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.4 \u00b7 Connector 1.2 |',
     'enabled:', Object.keys(BWN_MODULES).filter(function (k) { return BWN_MODULES[k]; }).join(', '));
 
   // ===== BWN SHARED CORE v7 - KEEP IN SYNC across both suite scripts =====
@@ -710,6 +710,121 @@
   BWN.announceCore('core');
   // ===== END BWN SHARED CORE =====
 
+  // ==========================================================================
+  // BOOT: document-start for the network hook, load event for the modules
+  // ==========================================================================
+  // This script ran at `@run-at document-idle` until 1.66.28. Measured on the live
+  // Work Orders list 2026-08-04, four reloads of the same page:
+  //
+  //   core script starts | GraphQL calls landing after it | List Heat auto-scan
+  //   4015 ms            | 0 of 17                        | never ran
+  //   1464 ms            | 15 of 18                       | ran
+  //   3466 ms            | 0 of 17                        | never ran
+  //   1822 ms            | 14 of 18                       | ran
+  //
+  // The app's FIRST GraphQL request starts at ~1240 ms (domContentLoaded 1068 ms,
+  // load 1253 ms). List Heat's capture is passive - it can only latch a board query
+  // that fires AFTER its hook is installed - so a late injection means `apiList`
+  // stays null, the v3.17 auto-scan returns on its first guard, and the coordinator
+  // silently gets viewport-only numbers until they press Scan All. Correlation over
+  // those four loads was exact: calls-after-script > 0 iff the scan ran.
+  //
+  // document-start fixes it because our whole script runs before any page script.
+  // The cost is that NOTHING page-related exists yet, so the modules are deferred
+  // back to the load event - which is where document-idle put them anyway. The three
+  // boot calls above are safe there already: injectTokens falls back to
+  // documentElement when there is no head, applyTheme only touches documentElement,
+  // and announceCore is storage + a timer.
+  //
+  // Umbrava exposes no client cache to read the query out of instead - checked live
+  // for __APOLLO_CLIENT__ and the Apollo / React Query / Relay devtools hooks.
+
+  // ---- The hook itself. Installed NOW; consumers attach later. ---------------
+  // Buffers request bodies until List Heat is alive to receive them, then becomes a
+  // straight pass-through. Deliberately dumb: it knows nothing about WO rows, so the
+  // whole capture decision (route gate, board-shape gate, anti-downgrade) stays in
+  // heatRecordCapture where it is tested. The response clone is a BONUS on the same
+  // path - v3.18 measured that clone reads lose races, so nothing may depend on it.
+  var BWN_GQL_SINK = null;
+  var BWN_GQL_BUF = [];
+  var BWN_GQL_BUF_MAX = 40;   // bounded: a page that never attaches a sink must not grow forever
+  function bwnGqlSeen(body, data) {
+    if (BWN_GQL_SINK) { try { BWN_GQL_SINK(body, data); } catch (e) { /* consumer's problem */ } return; }
+    if (BWN_GQL_BUF.length < BWN_GQL_BUF_MAX) BWN_GQL_BUF.push([body, data]);
+  }
+  // Attach a consumer and hand it everything seen so far, oldest first. Idempotent in
+  // the sense that matters: the buffer is emptied before the replay, so a second call
+  // cannot re-deliver the same request twice.
+  function bwnGqlSetSink(fn) {
+    BWN_GQL_SINK = fn;
+    var buf = BWN_GQL_BUF;
+    BWN_GQL_BUF = [];
+    for (var i = 0; i < buf.length; i++) {
+      try { fn(buf[i][0], buf[i][1]); } catch (e) { /* one bad frame must not stop the drain */ }
+    }
+    return buf.length;
+  }
+  (function installGqlHook() {
+    if (window.__bwnHeatNetHook) return;
+    window.__bwnHeatNetHook = true;
+    function isGqlUrl(u) { return typeof u === 'string' && /\/api\/graphql\b/.test(u); }
+    try {
+      var of = window.fetch;
+      if (typeof of === 'function') {
+        window.fetch = function (input, init) {
+          var url = (typeof input === 'string') ? input : (input && input.url) || '';
+          var body = (init && init.body) || (input && input.body) || null;
+          var p = of.apply(this, arguments);
+          if (isGqlUrl(url) && body) {
+            try { bwnGqlSeen(body, null); } catch (e) { }
+            try {
+              p.then(function (res) {
+                try { res.clone().json().then(function (j) { if (j && j.data) bwnGqlSeen(body, j.data); }, function () { }); } catch (e) { }
+                return res;
+              }, function () { });
+            } catch (e) { }
+          }
+          return p;
+        };
+      }
+    } catch (e) { }
+    try {
+      var oOpen = XMLHttpRequest.prototype.open, oSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (m, u) { this.__bwnUrl = u; return oOpen.apply(this, arguments); };
+      XMLHttpRequest.prototype.send = function (body) {
+        var xhr = this;
+        if (isGqlUrl(xhr.__bwnUrl) && body) {
+          try { bwnGqlSeen(body, null); } catch (e) { }
+          xhr.addEventListener('load', function () {
+            try { var j = JSON.parse(xhr.responseText); if (j && j.data) bwnGqlSeen(body, j.data); } catch (e) { }
+          });
+        }
+        return oSend.apply(this, arguments);
+      };
+    } catch (e) { }
+    console.info('[BWN] GraphQL hook installed at document-start - waiting for a consumer.');
+  })();
+
+  // ---- Module dispatch, deferred to the load event ---------------------------
+  // Every module below is registered through bwnBoot instead of running inline, so a
+  // module body still sees the same page state it saw at document-idle: body present,
+  // subresources done. A module registered after the flush (there are none today)
+  // still runs immediately rather than being dropped.
+  var BWN_BOOTED = false;
+  var BWN_BOOT_Q = [];
+  function bwnBoot(id, on, fn) {
+    if (!on) return;
+    if (BWN_BOOTED) { BWN.safeModule(id, fn); return; }
+    BWN_BOOT_Q.push([id, fn]);
+  }
+  function bwnBootAll() {
+    if (BWN_BOOTED) return;
+    BWN_BOOTED = true;
+    var q = BWN_BOOT_Q;
+    BWN_BOOT_Q = [];
+    for (var i = 0; i < q.length; i++) BWN.safeModule(q[i][0], q[i][1]);
+  }
+
   // ===== BEGIN bwnNotesApi =====
   // Notes WITHOUT scraping the list (2026-08-04). Both the AI drafts' collect and WO
   // Assist's Deep Scan used to walk the VIRTUALIZED notes list by scrolling it: slow,
@@ -999,7 +1114,7 @@
   // ==========================================================================
   // MODULE: PO Approval + ETA Builder v1.12
   // ==========================================================================
-  if (BWN_MODULES.poApproval) BWN.safeModule('poApproval', function () {
+  bwnBoot('poApproval', BWN_MODULES.poApproval, function () {
     'use strict';
 
     console.info('[BWN PO] userscript loaded on', location.href);
@@ -1284,7 +1399,7 @@
   // ==========================================================================
   // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.66 (Connector 1.2)
   // ==========================================================================
-  if (BWN_MODULES.woAssist) BWN.safeModule('woAssist', function () {
+  bwnBoot('woAssist', BWN_MODULES.woAssist, function () {
     'use strict';
 
     // ---- Config (edit here) ----------------------------------------------
@@ -4909,7 +5024,7 @@
   // ==========================================================================
   // MODULE: Email Leak Guard v2.0
   // ==========================================================================
-  if (BWN_MODULES.leakGuard) BWN.safeModule('leakGuard', function () {
+  bwnBoot('leakGuard', BWN_MODULES.leakGuard, function () {
     'use strict';
 
     var STRIP_ID = 'bwn-eg-strip';
@@ -5539,9 +5654,9 @@
   });
 
   // ==========================================================================
-  // MODULE: WO List Heat v3.19
+  // MODULE: WO List Heat v3.21
   // ==========================================================================
-  if (BWN_MODULES.listHeat) BWN.safeModule('listHeat', function () {
+  bwnBoot('listHeat', BWN_MODULES.listHeat, function () {
     'use strict';
 
     if (window.__bwnWoHeat) {
@@ -5550,7 +5665,7 @@
     }
     window.__bwnWoHeat = true;
 
-    console.info('[BWN HEAT] v3.19 loaded on', location.href);
+    console.info('[BWN HEAT] v3.21 loaded on', location.href);
 
     // ---- Config (edit here) ----------------------------------------------
     // Advanced knobs (status-class regexes + priority multipliers) now live in the
@@ -5937,7 +6052,8 @@
       var dneAmt = moneyNum(dne, g(/donotexceed.*precision/i));
       var nteAmt = moneyNum(nte, g(/totalnte.*precision/i));
       return {
-        href: '/work-orders/' + num,
+        // Through heatKey so the API writer and the DOM writer cannot drift apart again.
+        href: heatKey('/work-orders/' + num),
         entry: {
           id: num, wo: String(numRaw), tracking: String(g(/trackingnumber|(^|\.)tracking$/i) || '').replace(/\D+/g, ''),
           status: status, prio: prio, client: client, assignee: cleanName(assignee),
@@ -5958,8 +6074,8 @@
     }
 
     // Record a captured list query. THE REQUEST ALONE IS ENOUGH (v3.18).
-    // v3.15-3.17 only latched when the RESPONSE body could be read, via
-    // `res.clone().json()` in the hook below. That is a RACE, not a read: the app aborts
+    // v3.15-3.17 only latched when the RESPONSE body could be read, via the
+    // `res.clone().json()` in the hook. That is a RACE, not a read: the app aborts
     // its own fetches on teardown, and a clone only buffers while someone is still
     // reading it. Measured 2026-08-04 - with one more clone reader on the same responses,
     // EVERY clone read of EVERY operation rejected with AbortError and apiList stayed
@@ -6027,48 +6143,18 @@
       } catch (e) { /* capture is best-effort */ }
     }
 
-    // Install the fetch + XHR hooks ONCE per page (survives SPA route changes).
-    (function installNetHook() {
-      if (window.__bwnHeatNetHook) return;
-      window.__bwnHeatNetHook = true;
-      function isGqlUrl(u) { return typeof u === 'string' && /\/api\/graphql\b/.test(u); }
-      try {
-        var of = window.fetch;
-        if (typeof of === 'function') {
-          window.fetch = function (input, init) {
-            var url = (typeof input === 'string') ? input : (input && input.url) || '';
-            var body = (init && init.body) || (input && input.body) || null;
-            var p = of.apply(this, arguments);
-            if (isGqlUrl(url) && body) {
-              // Latch off the REQUEST first (v3.18): the clone read below is a race against
-              // the app's own teardown, so it cannot be the only path.
-              try { heatRecordCapture(body, null); } catch (e) { }
-              try {
-                p.then(function (res) {
-                  try { res.clone().json().then(function (j) { if (j && j.data) heatRecordCapture(body, j.data); }, function () { }); } catch (e) { }
-                  return res;
-                }, function () { });
-              } catch (e) { }
-            }
-            return p;
-          };
-        }
-      } catch (e) { }
-      try {
-        var oOpen = XMLHttpRequest.prototype.open, oSend = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = function (m, u) { this.__bwnUrl = u; return oOpen.apply(this, arguments); };
-        XMLHttpRequest.prototype.send = function (body) {
-          var xhr = this;
-          if (isGqlUrl(xhr.__bwnUrl) && body) {
-            try { heatRecordCapture(body, null); } catch (e) { }   // request-time latch (v3.18)
-            xhr.addEventListener('load', function () {
-              try { var j = JSON.parse(xhr.responseText); if (j && j.data) heatRecordCapture(body, j.data); } catch (e) { }
-            });
-          }
-          return oSend.apply(this, arguments);
-        };
-      } catch (e) { }
-      console.info('[BWN HEAT] network hook installed - waiting to capture the WO-list query.');
+    // Attach to the hook (v3.21). The fetch/XHR wrap itself moved to the top of this
+    // file and runs at document-start, because installing it here - at module-init
+    // time - lost a straight race with the SPA's own boot queries on roughly half of
+    // page loads, and a capture that never happens is an auto-scan that never runs.
+    // See the BOOT block for the four-reload measurement. Everything that DECIDES
+    // whether a request is the board query still lives in heatRecordCapture; the hook
+    // is deliberately ignorant. The drain replays whatever the app fired before this
+    // module existed, which on a normal arrival is the board query itself.
+    (function attachNetHook() {
+      var replayed = bwnGqlSetSink(function (body, data) { heatRecordCapture(body, data); });
+      console.info('[BWN HEAT] attached to the document-start GraphQL hook' +
+        (replayed ? ' - replayed ' + replayed + ' request(s) captured before this module loaded.' : ' - no earlier requests buffered.'));
     })();
 
     // ---- Helpers ------------------------------------------------------------
@@ -6082,6 +6168,18 @@
         if (/\/work-orders\/\d+/.test(as[i].getAttribute('href') || '')) return as[i];
       }
       return null;
+    }
+    // heatStore's KEY, and the ONE place that decides its shape (v3.20). Two writers fill
+    // that store - the API scan and the DOM tinting pass - and they were producing
+    // DIFFERENT strings for the same WO, so every row on screen was stored TWICE and the
+    // board count grew as the virtualizer rendered more. Measured live 2026-08-04: the
+    // list row's link is "/work-orders/371126/details" (a route suffix), the API path built
+    // "/work-orders/371126", and a ONE-row board announced "of 2 open - full board".
+    // The bare route redirects to /details, so the canonical key is still a working href
+    // for the audit panel's links. Returns null when there is no WO id to key on.
+    function heatKey(href) {
+      var m = String(href || '').match(/\/work-orders\/(\d+)/);
+      return m ? '/work-orders/' + m[1] : null;
     }
     function clearEl(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 
@@ -6642,7 +6740,20 @@
     var heatActsWarned = false;
 
     // ---- Heat pass ----------------------------------------------------------------
-    var heatStore = null;     // { href: {sev, reasons[], wo, client, status, assignee, prio, hrs, days, dne, sched, lastNote, exp} }
+    var heatStore = null;     // { heatKey(href): {sev, reasons[], wo, client, status, assignee, prio, hrs, days, dne, sched, lastNote, exp} }
+    // The DOM tinting pass's write into heatStore. Two rules, both learned the hard way:
+    //   - the key comes from heatKey, never from the raw href (see there);
+    //   - a row the API scan already read is NOT overwritten. The API record carries facts
+    //     no board row can supply - assigneeId, NTE, phase, vendors, remainingDays, the SLA
+    //     minutes - and clobbering it with the DOM read would blank those for exactly the
+    //     rows currently on screen, which is the subset a coordinator is looking at.
+    //     Only `acked` is refreshed, because a snooze can be toggled while the store stands.
+    function heatStoreDomPut(key, rec) {
+      if (!heatStore || !key) return;
+      var prev = heatStore[key];
+      if (prev && prev.src === 'api') { prev.acked = rec.acked; return; }
+      heatStore[key] = rec;
+    }
     var heatScanning = false;
     var heatScanAbort = false;   // set by the route-change observer so an in-flight API scan bails cleanly
     var heatScanClean = false;   // true only after a clean Scan All convergence - gates trend/snapshot writes
@@ -6765,7 +6876,7 @@
         } catch (eS) { /* best-effort */ }
 
         if (heatStore) {
-          heatStore[link.getAttribute('href')] = {
+          heatStoreDomPut(heatKey(link.getAttribute('href')), {
             id: rowId, kinds: kinds.slice(), acked: acked,
             sev: sev, reasons: reasons.slice(),
             wo: (link.textContent || '').trim() || cellText(tr, H.wo),
@@ -6779,7 +6890,7 @@
             // cell would zero the over-30 signal everywhere except the row tint (review).
             hrs: cellText(tr, H.hrs), days: cellText(tr, H.days) || (!isNaN(ageDays) ? String(Math.round(ageDays)) : ''), dne: cellText(tr, H.dne),
             sched: cellText(tr, H.sched), lastNote: cellText(tr, H.lastNote), exp: cellText(tr, H.exp)
-          };
+          });
         }
       });
       diag(table, H, nRows);
@@ -7802,7 +7913,7 @@
   // ==========================================================================
   // MODULE: BWN Launcher v2.0  (+ shared bwn:dock:* host for suite launchers)
   // ==========================================================================
-  if (BWN_MODULES.launcher) BWN.safeModule('launcher', function () {
+  bwnBoot('launcher', BWN_MODULES.launcher, function () {
     'use strict';
 
     if (window.__bwnLauncher) return;
@@ -8829,7 +8940,7 @@
   // ==========================================================================
   // MODULE: BWN Views v1.0  - column + assignee view presets on the WO list
   // ==========================================================================
-  if (BWN_MODULES.viewManager) BWN.safeModule('viewManager', function () {
+  bwnBoot('viewManager', BWN_MODULES.viewManager, function () {
     'use strict';
     console.info('[BWN VIEWS] loaded on', location.href);
 
@@ -9134,7 +9245,7 @@
   // offered only when its affordance is on the page (existence = context gating).
   // AI-script actions cross the sandbox boundary via bwn:cmd DOM events; each AI
   // module listens for its own ids, so the kill switches keep working.
-  if (BWN_MODULES.palette) BWN.safeModule('palette', function () {
+  bwnBoot('palette', BWN_MODULES.palette, function () {
     'use strict';
 
     var OV_ID = 'bwn-pal-overlay';
@@ -9336,7 +9447,7 @@
   // notes feed diffs the WO against how it looked when you personally last left
   // it - the per-WO complement to List Heat's board-wide triage. The same log
   // feeds a paste-ready "touched N WOs today" digest from the Tools menu.
-  if (BWN_MODULES.visitLog) BWN.safeModule('visitLog', function () {
+  bwnBoot('visitLog', BWN_MODULES.visitLog, function () {
     'use strict';
 
     var STRIP_ID = 'bwn-watch-strip';
@@ -9703,7 +9814,7 @@
   // back. Pure localStorage + Notification API - zero egress, no server. The
   // ticker only runs while an Umbrava tab is open (which is the point: the nudge
   // reaches you wherever you are IN Umbrava). Opened from the Tools menu / palette.
-  if (BWN_MODULES.reminders) BWN.safeModule('reminders', function () {
+  bwnBoot('reminders', BWN_MODULES.reminders, function () {
     'use strict';
 
     var currentWOId = BWN.woId;
@@ -9896,7 +10007,7 @@
   // visible at a glance. Sources the shared note cache (populated by a Deep Scan
   // / AI draft) for full history, merged with whatever is mounted now. Opened
   // from the Tools menu / palette.
-  if (BWN_MODULES.notesTimeline) BWN.safeModule('notesTimeline', function () {
+  bwnBoot('notesTimeline', BWN_MODULES.notesTimeline, function () {
     'use strict';
     var currentWOId = BWN.woId;
     function onWO() { return /\/work-orders\//.test(location.pathname); }
@@ -10051,7 +10162,7 @@
   // so the ECD helper on the details tab can use it as a completion signal.
   // Field extraction is per-SPAN (Umbrava concatenates trip fields with no
   // separators, so regex-on-joined-text fails - recon-verified WO 339766/trips).
-  if (BWN_MODULES.tripCal) BWN.safeModule('tripCal', function () {
+  bwnBoot('tripCal', BWN_MODULES.tripCal, function () {
     'use strict';
     var currentWOId = BWN.woId;
     var BTN_ID = 'bwn-tripcal-btn';
@@ -10234,5 +10345,12 @@
     obs.observe(document.body, { childList: true, subtree: true });
     ensureBtn();
   });
+
+  // ---- Flush the module queue -------------------------------------------------
+  // Every registration above is queued, so this line is what actually starts the
+  // suite. `complete` covers a Tampermonkey that injected late anyway (and any future
+  // @run-at change) - without it the load event has already fired and nothing boots.
+  if (document.readyState === 'complete') bwnBootAll();
+  else window.addEventListener('load', bwnBootAll);
 
 })();
