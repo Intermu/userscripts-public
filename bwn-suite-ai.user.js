@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - AI (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.42.2
+// @version      1.42.3
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-ai.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-ai.user.js
 // @description  The Umbrava tools that call outside APIs, kept separate from the zero-egress Core script. Client Update and WO Audit drafts (Anthropic Claude; draft-only, scrubbed before sending, you review before posting); Find Techs / Find Suppliers (Google Places; vendor leads near a WO); and Job View (opens the Ops-Dashboard job card on the WO page - WO details from Umbrava plus the authored case file and next actions, read-only). Network access is limited by the browser to the declared API hosts and the BWN Static Web App. API keys are stored in Tampermonkey's storage via the menu commands and never enter the page. Toggle modules in BWN_MODULES below.
@@ -708,6 +708,133 @@
   BWN.applyTheme(BWN.getTheme());
   BWN.announceCore('ai');
   // ===== END BWN SHARED CORE =====
+
+  // ===== BEGIN bwnNotesApi =====
+  // Notes WITHOUT scraping the list (2026-08-04). Both the AI drafts' collect and WO
+  // Assist's Deep Scan used to walk the VIRTUALIZED notes list by scrolling it: slow,
+  // and only ever as complete as the sweep managed to see. Umbrava's own API answers
+  // the same question in ONE call. Measured on W-283834:
+  //   workOrderNotes(workOrderNumber: 283834) -> 308 notes, while the DOM had 17
+  //   mounted; all 17 bodies byte-identical to the rendered text (`content` is PLAIN
+  //   TEXT - do not strip "tags", it eats <someone@example.com>); createdDate is an
+  //   absolute ISO stamp instead of the relative strings a scrape has to guess at.
+  // The note TYPE comes back as an int, so noteTypesV2 supplies the label map (82 rows,
+  // cached for a day) - all 17 mounted labels matched their type name.
+  // Same-origin fetch on the app's own bearer, so @grant none still holds.
+  // EVERY failure path REJECTS so the caller falls back to the scroll sweep: no token,
+  // schema drift, a non-list payload, or a read that does not even contain the notes
+  // currently on screen. Degrading to the old behaviour is fine; silently handing a
+  // draft a partial history is not.
+  // Byte-identical in bwn-suite-core and bwn-suite-ai - scripts/test-notes-api.js gates
+  // that with a SHA, the same rule as the bwnAI transport block.
+  var BWN_NOTES_TYPES_KEY = 'bwn:noteTypes';
+  var BWN_NOTES_TYPES_TTL = 24 * 3600000;
+  var BWN_NOTES_QUERY = 'query BwnWorkOrderNotes($n: Int!) { workOrderNotes(workOrderNumber: $n) { id type content createdDate lastModifiedDate isDeleted } }';
+  // Auth0 access token from the SPA's own cache, picked by CONTENT: the audience slot
+  // transiently holds non-Umbrava tokens, so the issuer and expiry are checked.
+  function bwnNotesToken() {
+    try {
+      var keys = Object.keys(localStorage).filter(function (x) {
+        return /@@auth0spajs@@::.*::https:\/\/app\.umbrava\.com\/api::/.test(x);
+      });
+      for (var i = 0; i < keys.length; i++) {
+        var body = (JSON.parse(localStorage.getItem(keys[i])) || {}).body;
+        var tok = (body && body.access_token) || '';
+        if (!tok) continue;
+        var parts = String(tok).split('.');
+        if (parts.length !== 3) continue;
+        var p = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+        var iss = String(p.iss || '').replace(/\/+$/, '');
+        if (iss !== 'https://login.umbrava.com' && iss !== 'https://umbrava.us.auth0.com') continue;
+        if (typeof p.exp === 'number' && (Date.now() / 1000) > p.exp) continue;
+        return tok;
+      }
+    } catch (e) { }
+    return '';
+  }
+  function bwnNotesGql(query, variables) {
+    var tok = bwnNotesToken();
+    if (!tok) return Promise.reject(new Error('no live Umbrava token in this tab'));
+    return fetch('/api/graphql', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: query, variables: variables || {} })
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      if (j && j.errors && j.errors.length) throw new Error(j.errors[0].message || 'GraphQL error');
+      if (!j || !j.data) throw new Error('empty GraphQL response');
+      return j.data;
+    });
+  }
+  // type id -> label. A failure here must NOT fail the notes read: labels degrade to '',
+  // which only widens a keep-list filter. It can never invent or drop a note.
+  function bwnNoteTypeMap() {
+    try {
+      var c = JSON.parse(localStorage.getItem(BWN_NOTES_TYPES_KEY) || 'null');
+      if (c && c.v === 1 && c.map && (Date.now() - (c.ts || 0)) < BWN_NOTES_TYPES_TTL) return Promise.resolve(c.map);
+    } catch (e) { }
+    return bwnNotesGql('{ noteTypesV2 { id name } }').then(function (d) {
+      var map = {};
+      (d.noteTypesV2 || []).forEach(function (t) { if (t && t.id != null) map[String(t.id)] = String(t.name == null ? '' : t.name); });
+      try { localStorage.setItem(BWN_NOTES_TYPES_KEY, JSON.stringify({ v: 1, ts: Date.now(), map: map })); } catch (e2) { }
+      return map;
+    }, function () { return {}; });
+  }
+  // Render the ISO stamp the way the notes list renders it ("6/24/2026, 9:52 AM") so
+  // every existing consumer - parseNoteDateLoose, looksLikeNoteTimestamp, the staleness
+  // math - reads an API note exactly as it read a scraped one. tsAbs carries the exact
+  // epoch beside it, so nothing has to re-parse to be precise.
+  function bwnNotesTsText(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    if (isNaN(+d)) return '';
+    var h = d.getHours(), ap = h >= 12 ? 'PM' : 'AM';
+    h = h % 12; if (h === 0) h = 12;
+    var mm = d.getMinutes(); mm = (mm < 10 ? '0' : '') + mm;
+    return (d.getMonth() + 1) + '/' + d.getDate() + '/' + d.getFullYear() + ', ' + h + ':' + mm + ' ' + ap;
+  }
+  // Coverage gate: if the notes list is on screen, every note MOUNTED in it must be in
+  // the API result. That is the one check that catches a read of the wrong thing without
+  // trusting counts. Nothing mounted = nothing to check (the API is then the only source).
+  function bwnNotesApiCovers(list) {
+    var have = {};
+    (list || []).forEach(function (n) { have[String(n.id)] = 1; });
+    var mounted = document.querySelectorAll('[data-testid^="wo-note-"][data-testid$="-summary"]');
+    for (var i = 0; i < mounted.length; i++) {
+      var m = (mounted[i].getAttribute('data-testid') || '').match(/wo-note-(\d+)-summary/);
+      if (m && !have[m[1]]) return false;
+    }
+    return true;
+  }
+  // Resolves [{id, label, ts, tsAbs, body}] - the SAME shape the scrape produces and the
+  // shared bwn:notes bus stores, so no consumer downstream can tell the difference.
+  function bwnNotesApi(woNumber) {
+    var n = parseInt(String(woNumber == null ? '' : woNumber).replace(/\D/g, ''), 10);
+    if (!n) return Promise.reject(new Error('no WO number for the notes read'));
+    return bwnNoteTypeMap().then(function (types) {
+      return bwnNotesGql(BWN_NOTES_QUERY, { n: n });
+    }, function () { return bwnNotesGql(BWN_NOTES_QUERY, { n: n }); }).then(function (d) {
+      var rows = d && d.workOrderNotes;
+      if (!Array.isArray(rows)) throw new Error('workOrderNotes did not return a list');
+      var types = {};
+      try { var c = JSON.parse(localStorage.getItem(BWN_NOTES_TYPES_KEY) || 'null'); if (c && c.map) types = c.map; } catch (e) { }
+      var out = [];
+      rows.forEach(function (r) {
+        if (!r || r.isDeleted) return;               // the list does not show deleted notes
+        var iso = r.createdDate || r.lastModifiedDate || '';
+        var dt = iso ? new Date(iso) : null;
+        out.push({
+          id: String(r.id),
+          label: (r.type != null && types[String(r.type)]) || '',
+          ts: bwnNotesTsText(iso),
+          tsAbs: (dt && !isNaN(+dt)) ? +dt : null,
+          body: String(r.content == null ? '' : r.content).trim()
+        });
+      });
+      if (!bwnNotesApiCovers(out)) throw new Error('API notes did not include every note on screen - not trusting it');
+      return out;
+    });
+  }
+  // ===== END bwnNotesApi =====
 
   // ---- Outer-scope aliases (names used by both AI modules) ----------------
   // Bus = read-only consumer of Core's contract; config falls back to defaults
@@ -1608,17 +1735,37 @@
       var store = {};
       var epoch = bwnWOId();
       var overlayEl = document.getElementById('bwn-cu-overlay');   // this run's modal instance
+      // The API read (bwnNotesApi) answers in one call what the sweep below scrolls for.
+      // It gets the SAME abort identity as the sweep: a WO change or THIS modal closing
+      // discards the result, so a late answer can never seed the next WO's draft.
+      function stillOurs() { return bwnWOId() === epoch && document.getElementById('bwn-cu-overlay') === overlayEl; }
+      function abortNow() {
+        console.info('[BWN CU] note collection aborted - page or modal changed mid-collect');
+        // If the modal survived (browser-chrome navigation), tell it - otherwise
+        // it sits frozen at "Collecting…" over the new page forever.
+        if (onAbort && document.getElementById('bwn-cu-overlay') === overlayEl) onAbort();
+      }
+      bwnNotesApi(epoch).then(function (list) {
+        if (!stillOurs()) { abortNow(); return; }
+        list.forEach(function (n) { store[n.id] = { label: n.label || '', ts: n.ts || '', body: n.body || '' }; });
+        if (progress) progress(list.length);
+        busNotesPut(list);          // one API read serves every other tool on this WO too
+        console.info('[BWN CU] notes read from the API:', list.length, 'notes - no scrolling');
+        doneCb(store);
+      }, function (err) {
+        console.info('[BWN CU] API notes read unavailable (' + ((err && err.message) || err) + ') - falling back to the scroll sweep');
+        if (!stillOurs()) { abortNow(); return; }
+        sweep();
+      });
+      function sweep() {
       BWN.harvest({
         scroller: notesScroller(),
         rescroller: notesScroller,
         capture: function () { captureMounted(store); },
         count: function () { return Object.keys(store).length; },
         cancelled: function () {
-          if (bwnWOId() === epoch && document.getElementById('bwn-cu-overlay') === overlayEl) return false;
-          console.info('[BWN CU] note collection aborted - page or modal changed mid-collect');
-          // If the modal survived (browser-chrome navigation), tell it - otherwise
-          // it sits frozen at "Collecting…" over the new page forever.
-          if (onAbort && document.getElementById('bwn-cu-overlay') === overlayEl) onAbort();
+          if (stillOurs()) return false;
+          abortNow();
           return true;
         },
         progress: progress,
@@ -1636,6 +1783,7 @@
           doneCb(store);
         }
       });
+      }
     }
 
     // Apply keep-list + scrub to the collected notes.
@@ -2506,7 +2654,7 @@
       }
 
       function startCollect(forceFresh) {
-        m.loading('Collecting the full note history\u2026', 'scrolling the notes list');
+        m.loading('Collecting the full note history\u2026', 'one API read - scroll sweep only if that fails');
         m.estimate(25, 6000);
         collectAllNotes(
           function (n) { m.loading('Collecting the full note history\u2026', n + ' notes loaded'); },
