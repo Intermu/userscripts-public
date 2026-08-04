@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.20
+// @version      1.66.21
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -1856,6 +1856,7 @@
         due: dueStatus(C),
         staleDays: staleness(notes), noteCount: notes.length, lastNote: lastNoteTs ? new Date(lastNoteTs).toISOString() : null, deep: !!deepNotes, notesSrc: lastNotesSrc,
         lastClientNoteDays: lastClientTs ? Math.floor((Date.now() - lastClientTs) / 86400000) : null,   // null = no client-labeled note among the loaded notes
+        lastClientNote: lastClientTs ? new Date(lastClientTs).toISOString() : null,   // same signal, full precision - published on the bus for queue convergence
         noShow: (function () { try { var tb = BWN.ssGetJSON('bwn:trips:' + (currentWOId() || ''), null); return (tb && tb.noShow && (Date.now() - (tb.ts || 0)) < 12 * 3600000) ? tb.noShow : null; } catch (e) { return null; } })(),   // 12h TTL bounds a stale phantom in a long-lived tab
         openTasks: readOpenTasks(),
         // Phase 4: the DOM/store inputs the pure computeNextActions engine needs, assembled
@@ -4636,6 +4637,11 @@
           priority: st.priority || '',
           trade: ((st.woApi && st.woApi.trades && st.woApi.trades.map) ? st.woApi.trades.map(function (t) { return t && t.name; }).filter(Boolean).join(', ') : '') || hd.trade || '',
           staleDays: (st.staleDays != null ? st.staleDays : null), noteCount: (st.noteCount != null ? st.noteCount : null), lastNote: st.lastNote || null,
+          // The newest CLIENT-typed note, as a full timestamp. `lastClientNoteDays` has been on
+          // state for the cadence step since Phase 3, but day granularity cannot answer "did we
+          // reply AFTER this item opened" on the day it opened - which is exactly the question
+          // the queue's client-response convergence asks (bwn-wo-assist, queue-spec step 4).
+          lastClientNote: st.lastClientNote || null,
           vendorTotal: (st.vendorTotal != null ? st.vendorTotal : null),
           dne: st.nte ? st.nte.amount : null, dneSource: st.nte ? st.nte.source : null,
           pos: st.pos.map(function (p) { return { vendor: p.vendor, amount: p.amount, sched: p.schedDate || null, done: !!p.done }; }),

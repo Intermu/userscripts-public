@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Drop Upload (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.9.1
+// @version      1.10.0
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-drop-upload.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-drop-upload.user.js
 // @description  Drop files anywhere on an Umbrava work order to upload them. Opens the Documents tab and upload dialog, hands over the files, and builds each file's description from its contents. Emails are parsed locally (.msg via an OLE/MAPI reader, .eml via RFC822) into an Outlook-style block - From/Sent/To/Cc/Subject and the body - that becomes the WO note, led by a one-line summary from Chrome's on-device built-in AI (zero cost, zero egress, nothing leaves the browser), falling back to local WO-field extraction (store, city/state, priority, PO, NTE, problem, requester) when the on-device model is unavailable. That same summary fills each file's Description. The WO note's Type is chosen from the email's parties: inbound is typed by the sender (client -> Client, else Vendor); outbound from Broadway is typed by the recipients (a client recipient -> Client, any vendor recipient -> Vendor, all-internal -> Internal). Umbrava's Description field is a locked react-aria combobox that rejects programmatic fills, so the description goes on your clipboard for a one-tap Ctrl+V. When WO Intake hands off a just-created WO's request email, each uploaded file's Label (document type) is set to "Work Order Request". You review and Save everything. Runs in the browser only: no network access, no grants.
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  var VER = '1.8.0';
+  var VER = '1.10.0';   // was '1.8.0' while @version read 1.9.1 - the console banner had been two releases stale
   console.info('[BWN DROP UPLOAD] v' + VER + ' · Email→note: real .msg (OLE/MAPI) + .eml parsing · on-device AI one-line summary (Chrome built-in, zero egress) leads the note + fills Description, local field-extraction fallback · note Type by parties (inbound=sender, outbound=recipient) · document Label + note Type selectors both target their stable testids · WO Intake handoff sets Label=Work Order Request · bwn:cmd dropupload:files bridge');
 
   // Active only on WO pages; checked at drag time so SPA navigation needs no watcher.
@@ -477,6 +477,24 @@
       if (f && f.isEmail && f.email) return noteTypeForEmail(f.email);
     }
     return 'Client';
+  }
+
+  // ---- "Needs a client response" (wo-assist queue, build step 4) ---------------
+  // The first INBOUND email from a client domain in this drop. Only such a drop can owe a
+  // reply: an outbound email is the reply, and a vendor email is somebody else's thread. The
+  // toggle is offered on nothing else, because a checkbox that shows up on every drop is a
+  // checkbox nobody reads.
+  function inboundClientEmail(files) {
+    for (var i = 0; i < (files || []).length; i++) {
+      var f = files[i];
+      if (!f || !f.isEmail || !f.email) continue;
+      if (classifyDomain(f.email.fromEmail) === 'Client') return f;
+    }
+    return null;
+  }
+  function woIdFromUrl() {
+    var m = String(location.pathname || '').match(/\/work-orders\/(\d+)/);
+    return m ? m[1] : '';
   }
 
   // ===== bwnAI v1 - shared suite-wide AI router - KEEP IN SYNC across suite scripts =====
@@ -1254,9 +1272,79 @@
     });
   }
 
+  // ---- The needs-a-response chip ----------------------------------------------
+  // BWN-owned DOM, deliberately. The obvious place for this toggle is inside Umbrava's own
+  // upload dialog, but injecting a control into a third-party MUI dialog makes the feature a
+  // hostage to their markup; this floats beside it and cannot be broken by a re-render.
+  // It lives exactly as long as `pending` does, so it disappears with a cancelled drop.
+  var respChip = null, respTimer = null;
+  function clearRespChip() {
+    if (respChip) { try { respChip.remove(); } catch (e) { } respChip = null; }
+    if (respTimer) { clearTimeout(respTimer); respTimer = null; }
+  }
+  function showRespChip() {
+    clearRespChip();
+    if (!pending || !inboundClientEmail(pending.files) || !woIdFromUrl()) return;
+    var box = document.createElement('div');
+    box.id = 'bwn-du-resp';
+    box.style.cssText =
+      'position:fixed;right:22px;bottom:22px;z-index:2147483001;max-width:330px;' +
+      'background:#fff;border:1px solid #c6d2cc;border-left:4px solid #b46b00;border-radius:10px;' +
+      'box-shadow:0 8px 28px rgba(0,0,0,.22);padding:11px 13px;' +
+      'font:400 12.5px/1.45 -apple-system,BlinkMacSystemFont,\'Segoe UI\',\'Helvetica Neue\',Arial,sans-serif;color:#12241b;';
+    var lab = document.createElement('label');
+    lab.style.cssText = 'display:flex;gap:9px;align-items:flex-start;cursor:pointer;';
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.style.cssText = 'margin:2px 0 0;flex:0 0 auto;width:15px;height:15px;cursor:pointer;';
+    cb.checked = !!(pending && pending.needsResponse);
+    cb.addEventListener('change', function () { if (pending) pending.needsResponse = cb.checked; });
+    var txt = document.createElement('div');
+    txt.innerHTML =
+      '<strong style="font-weight:600;">This client email needs a response</strong>' +
+      '<div style="color:#5b6b8c;margin-top:3px;">Opens a tracked item on this WO, due on the priority clock. ' +
+      'The upload note is logged as <strong>Internal</strong> so it does not read as "we updated the client".</div>';
+    lab.appendChild(cb); lab.appendChild(txt);
+    box.appendChild(lab);
+    document.body.appendChild(box);
+    respChip = box;
+    // Outlives the drop dialog by design, but not the pending window: if the coordinator
+    // wanders off, the chip goes with the drop it belongs to.
+    respTimer = setTimeout(clearRespChip, PENDING_TTL);
+  }
+
+  // Ask bwn-wo-assist to record the item. This script is @grant none - it has no egress at
+  // all - so the assist script owns the POST. The ack leg is not optional: without it a
+  // failed track is silent, and the coordinator walks away believing the WO is tracked.
+  var _trackWait = {};
+  function requestTrack(file, woId) {
+    var m = file.email || {};
+    var reqId = 'du-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+    var detail = {
+      id: 'bwn:assist:track', reqId: reqId, wo: woId, woNumber: woId,
+      emailFrom: m.fromEmail || '', emailSubject: m.subject || '',
+      ask: file.summary || m.subject || '', docRef: file.name || '', source: 'drop'
+    };
+    _trackWait[reqId] = setTimeout(function () {
+      delete _trackWait[reqId];
+      // No answer at all means the assist script is not installed or not listening. Say the
+      // thing that is actually true and actionable, rather than "failed".
+      toast('The email uploaded, but nothing tracked it - BWN WO Assist is not running on this page.');
+    }, 20000);
+    try { document.dispatchEvent(new CustomEvent('bwn:evt', { detail: detail })); }
+    catch (e) { clearTimeout(_trackWait[reqId]); delete _trackWait[reqId]; toast('Could not ask WO Assist to track that email.'); }
+  }
+  document.addEventListener('bwn:evt', function (e) {
+    var d = e && e.detail;
+    if (!d || d.id !== 'bwn:assist:tracked' || !d.reqId || !_trackWait[d.reqId]) return;
+    clearTimeout(_trackWait[d.reqId]); delete _trackWait[d.reqId];
+    if (d.ok) toast('Tracked as needing a client response' + (d.why ? ' - ' + d.why : '') + '.');
+    else toast('NOT tracked: ' + (d.why || 'the assist queue refused it') + '. The upload and the note are fine.');
+  }, false);
+
   document.addEventListener('click', function (e) {
     if (!pending) return;
-    if (Date.now() - pending.ts > PENDING_TTL) { pending = null; return; }
+    if (Date.now() - pending.ts > PENDING_TTL) { pending = null; clearRespChip(); return; }
     var btn = e.target && e.target.closest ? e.target.closest('button') : null;
     if (!btn) return;
     var dlg = btn.closest('[role="dialog"], .MuiDialog-root');
@@ -1269,9 +1357,25 @@
     var seen = pending.files.some(function (f) { return f.name && dlgText.indexOf(String(f.name).slice(0, 12)) !== -1; });
     if (!seen) return;
     var note = pending.noteText, originTab = pending.originTab || '', noteType = pending.noteType || 'Client';
+    // Step 4: a tracked inbound client email is logged as INTERNAL, not Client. Two reasons,
+    // and both are load-bearing rather than cosmetic:
+    //   1. the item converges on an OUTBOUND reply, and a Client-typed note newer than the
+    //      item would instantly self-close the thing that was just opened;
+    //   2. a Client-typed note resets Next Actions' client-cadence clock, so logging a
+    //      question we have NOT answered would read as "we updated the client".
+    var track = null;
+    if (pending.needsResponse) {
+      var f = inboundClientEmail(pending.files);
+      var woId = woIdFromUrl();
+      if (f && woId) { track = { file: f, woId: woId }; noteType = 'Internal'; }
+    }
     pending = null;
+    clearRespChip();
     // Let the dialog close and the upload kick off before touching the notes pane.
     setTimeout(function () { insertNote(note, originTab, noteType); }, 1400);
+    // Fire the track alongside the note rather than after it: the note is a human-review
+    // draft that may sit unsaved for minutes, and the queue item should not wait on that.
+    if (track) requestTrack(track.file, track.woId);
   }, true);
 
   // ---- Drop overlay ----------------------------------------------------------
@@ -1328,7 +1432,11 @@
         // On a merge, keep the FIRST drop's origin view - later drops fire after the script
         // has already switched to Documents, so their origin would just be "Documents".
         var origin = (fresh && pending.originTab) ? pending.originTab : originTab;
-        pending = { ts: Date.now(), files: merged, noteText: buildNoteText(merged), originTab: origin, noteType: noteTypeForFiles(merged) };
+        // A merge keeps an already-ticked toggle: the coordinator answered the question once,
+        // and dropping a second attachment is not them changing their mind.
+        var keepResp = !!(fresh && pending.needsResponse);
+        pending = { ts: Date.now(), files: merged, noteText: buildNoteText(merged), originTab: origin, noteType: noteTypeForFiles(merged), needsResponse: keepResp };
+        showRespChip();
       });
       handleDrop(dt, described, ctx);
     });

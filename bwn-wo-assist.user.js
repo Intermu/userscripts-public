@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN WO Assist (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.2.0
+// @version      0.3.0
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-wo-assist.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-wo-assist.user.js
 // @description  Escalate a work order to management from inside Umbrava, and round-trip its state back onto the page. Pick why and say what you need; it POSTs to the broadway-internal-ops SWA proxy (x-bwn-key gated) which proves your Umbrava session token, injects your verified email as the requester, works out WHO it goes to from your rank (a coordinator escalates to a supervisor, a supervisor to management, a director owns the call), sets a due clock scaled by the job's priority, records the item in the shared assist queue, and only then sends the notify. Escalating the same work order twice while the first is still open is rejected server-side, so two tabs cannot double-fire. While an escalation is open, this script also reads its state back (op:'status') and publishes it on the suite bus, so the WO Assist checklist shows "Escalated - awaiting mgmt" and the drawer becomes an acknowledge/resolve panel instead of a duplicate form. Registers one "Escalate" entry in the shared dock tab and adds an Escalate button to the WO Assist checklist's escalation step; a Tampermonkey menu item opens it too, so it is never stranded. The flow's secret URL stays server-side; nothing sensitive lives in this script.
@@ -18,7 +18,7 @@
 (function () {
   'use strict';
 
-  var VER = '0.2.0';
+  var VER = '0.3.0';
   var FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Arial,sans-serif";
   var SWA_BASE = 'https://green-stone-0717dab0f.7.azurestaticapps.net';
   var PROXY_URL = SWA_BASE + '/api/wo-assist';
@@ -119,7 +119,7 @@
     var d = e && e.detail; if (!d) return;
     // The host ping doubles as the state-refresh tick: queryState is TTL-cached per WO,
     // so this re-queries only on an SPA nav to a different WO or every ~5 minutes.
-    if (d.id === 'bwn:dock:host' || d.id === 'bwn:dock:ping') { dockRegister(); queryState(woIdFromUrl()); }
+    if (d.id === 'bwn:dock:host' || d.id === 'bwn:dock:ping') { dockRegister(); queryState(woIdFromUrl()); queryCrState(woIdFromUrl()); }
     if (d.id === 'bwn:dock:open' && d.key === DOCK_KEY) openAssist();
     // Another tool took the drawer slot - close ours (a half-typed reason is dropped, same
     // as Escape). Matches every other drawer in the suite.
@@ -132,6 +132,11 @@
       _pendingSource = 'next-actions';
       if (d.open) openAssist();
     }
+    // Step 4: Drop Upload marked a dropped inbound client email as owing a reply. It has no
+    // egress of its own, so the POST and the ack are ours.
+    if (d.id === 'bwn:assist:track') trackClientResponse(d);
+    // Step 4 convergence: an outbound client reply was seen, so the item it answers is done.
+    if (d.id === 'bwn:assist:resolve' && d.recordId) resolveById(String(d.recordId), d.wo ? String(d.wo) : '');
   });
 
   // ---- Shared launcher dock (bwn:dock:*) -----------------------------------
@@ -233,6 +238,146 @@
         btns.forEach(function (b) { b.disabled = false; });
         msg.textContent = (err && err.message ? err.message : 'could not reach the proxy') + '.';
       });
+  }
+
+  // ---- Client-response tracking (queue-spec step 4) --------------------------
+  // THE ZERO-EGRESS SPLIT. Drop Upload is @grant none - it cannot POST anywhere - so when a
+  // coordinator marks a dropped inbound email as owing a reply, it EMITS bwn:assist:track and
+  // this script does the network. The handshake is two-way on purpose: every track is answered
+  // with bwn:assist:tracked, success or failure, so the drop side can say "not tracked" instead
+  // of leaving the coordinator believing a queue item exists. Silence is the one outcome the
+  // drop side cannot interpret, so this function never returns without acking.
+  var TRACK_KIND = 'client-response';
+  var _trackSeen = {};        // reqId -> ts; a re-broadcast bus event must not post twice
+  function trackAck(reqId, ok, why, recordId) {
+    try {
+      document.dispatchEvent(new CustomEvent('bwn:evt', { detail: {
+        id: 'bwn:assist:tracked', reqId: reqId || '', ok: !!ok, why: why || '', recordId: recordId || ''
+      } }));
+    } catch (e) { }
+  }
+  function trackClientResponse(d) {
+    var reqId = String(d.reqId || '');
+    // Dedup on the request id. Two tabs on the same WO both hear the bus event, and the
+    // server would dedup the second anyway - but a duplicate POST also burns the per-actor
+    // rate limit and races its own ack.
+    if (reqId && _trackSeen[reqId]) return;
+    if (reqId) _trackSeen[reqId] = Date.now();
+    var woId = String(d.woNumber || woIdFromUrl() || '');
+    if (!woId) { trackAck(reqId, false, 'no work order in view'); return; }
+    var key = GM_getValue('ingest_key', '');
+    if (!key) { trackAck(reqId, false, 'the SWA ingest key is not set (Tampermonkey menu -> "Set SWA ingest key")'); return; }
+    var tok = authToken();
+    if (!tok) { trackAck(reqId, false, 'no usable Umbrava session token - reload the tab'); return; }
+    var emailFrom = String(d.emailFrom || '').slice(0, 200);
+    if (!emailFrom) { trackAck(reqId, false, 'that email has no sender to track it by'); return; }
+    var bus = busGet(woId, 12 * 3600 * 1000) || {};
+    gmPost(PROXY_URL, { 'Content-Type': 'application/json', 'x-bwn-key': key }, {
+      userToken: tok, client: 'pilot', kind: TRACK_KIND, woNumber: woId,
+      emailFrom: emailFrom,
+      emailSubject: String(d.emailSubject || '').slice(0, 300),
+      ask: String(d.ask || '').slice(0, 4000),
+      docRef: String(d.docRef || '').slice(0, 300),
+      location: bus.location || '', trade: bus.trade || '',
+      priority: bus.priority || '', woStatus: bus.status || '',
+      source: 'drop'
+    }, 30000)
+      .then(function (r) {
+        var j = r.json;
+        // 2xx with a non-JSON body means the SPA fallback answered, i.e. the route is not
+        // deployed. Same trap the escalate path guards; a bare 2xx is not proof of anything.
+        if (r.status >= 200 && r.status < 300 && !j) { trackAck(reqId, false, 'the assist route did not answer (a page came back, not a result)'); return; }
+        if (r.status >= 200 && r.status < 300 && j && j.ok) {
+          // Refresh the published client-response state either way - the queue now holds an
+          // item for this WO, and anything rendering off bwn:assist:cr should know now rather
+          // than up to five minutes later.
+          queryCrState(woId, true);
+          if (j.duplicate) { trackAck(reqId, true, 'already tracked - opened ' + shortWhen(j.openedAt), j.id); return; }
+          // 502-with-recorded is handled below; here the record and the confirmation both landed.
+          trackAck(reqId, true, '', j.id);
+          return;
+        }
+        if (r.status === 502 && j && j.recorded) {
+          // The item IS in the queue; only the confirmation email failed. Reporting this as a
+          // failure would invite a re-drop that the server would dedup-refuse, so it acks OK
+          // and says what did not happen.
+          queryCrState(woId, true);
+          trackAck(reqId, true, 'tracked, but the confirmation email did not send', j.id);
+          return;
+        }
+        if (r.status === 400 && j && /kind must be one of/.test(j.error || '')) {
+          // A route that predates step 4 rejects the kind outright - a diagnostic fingerprint,
+          // the same shape step 3 used for its own not-yet-deployed case.
+          trackAck(reqId, false, 'the assist server does not know client-response yet (route update not deployed)');
+          return;
+        }
+        var msg = (j && j.error) ? j.error : ('failed (' + r.status + ')');
+        if (r.status === 403) msg = 'rejected (403): the SWA ingest key is missing or wrong';
+        if (r.status === 401) msg = 'Umbrava could not verify your session - reload the tab';
+        if (r.status === 429) msg = 'too many requests in a row - wait a moment';
+        trackAck(reqId, false, msg);
+      })
+      .catch(function (err) { trackAck(reqId, false, (err && err.message) || 'could not reach the assist proxy'); });
+  }
+  // The client-response side of the state round-trip, kept in its OWN sessionStorage key and
+  // its own bus event. Sharing `bwn:assist:state` would make Core's escalation strip flicker
+  // between two records that mean different things.
+  var SS_CR = 'bwn:assist:cr:';
+  var _lastCrQ = { wo: null, ts: 0 };
+  var _crAutoTried = {};   // record id -> 1: convergence fires ONCE per item per page session
+  function publishCr(woId, found, record) {
+    if (!woId) return;
+    try { sessionStorage.setItem(SS_CR + woId, JSON.stringify({ v: 1, ts: Date.now(), found: !!found, record: record || null })); } catch (e) { }
+    try { document.dispatchEvent(new CustomEvent('bwn:evt', { detail: { id: 'bwn:assist:cr', wo: woId, found: !!found, record: record || null } })); } catch (e) { }
+  }
+  function queryCrState(woId, force) {
+    if (!woId) return;
+    var key = GM_getValue('ingest_key', ''); if (!key) return;
+    var tok = authToken(); if (!tok) return;
+    if (!force && _lastCrQ.wo === woId && (Date.now() - _lastCrQ.ts) < QUERY_TTL_MS) return;
+    _lastCrQ = { wo: woId, ts: Date.now() };
+    gmPost(PROXY_URL, { 'Content-Type': 'application/json', 'x-bwn-key': key }, { op: 'status', userToken: tok, woNumber: woId, client: 'pilot', kind: TRACK_KIND }, 20000)
+      .then(function (r) {
+        // A route that predates step 4 400s the kind: publish NOTHING, exactly as step 3 does
+        // for its own not-yet-deployed case, so the page looks as it did before.
+        if (!(r.json && r.json.ok)) return;
+        var rec = r.json.found ? (r.json.record || null) : null;
+        publishCr(woId, !!rec, rec);
+        if (rec) maybeConverge(woId, rec);
+      })
+      .catch(function () { });
+  }
+  // CONVERGENCE. The item closes on an OUTBOUND client reply, and the signal is Core's newest
+  // client-typed note being newer than the item's openedAt. That test is only sound because the
+  // drop re-types its own inbound log note to Internal - otherwise logging the question would
+  // instantly answer it. Bounded to one attempt per item per page session: a server that says
+  // "already resolved" must not be asked again on every 5-minute tick.
+  function maybeConverge(woId, rec) {
+    if (!rec || !rec.id || _crAutoTried[rec.id]) return;
+    if (rec.status !== 'open' && rec.status !== 'ack') return;
+    var bus = busGet(woId, 12 * 3600 * 1000) || {};
+    var lastClient = bus.lastClientNote || '';
+    // String compare is correct here and cheap: both are ISO-8601 UTC from the same clock.
+    if (!lastClient || !rec.openedAt || lastClient <= rec.openedAt) return;
+    _crAutoTried[rec.id] = 1;
+    resolveById(rec.id, woId);
+  }
+  // Convergence: something in the page (Core's note reader) decided this item is answered.
+  // Fire the same resolve verb the drawer uses. No UI here - the emitter owns the telling -
+  // but the state is republished so the checklist strip clears on the next render.
+  function resolveById(id, woId) {
+    var key = GM_getValue('ingest_key', ''), tok = authToken();
+    if (!id || !key || !tok) return;
+    gmPost(PROXY_URL, { 'Content-Type': 'application/json', 'x-bwn-key': key }, { op: 'resolve', userToken: tok, id: id, client: 'pilot' }, 30000)
+      .then(function (r) {
+        if (r.json && r.json.ok) {
+          var rec = r.json.record || null;
+          var active = rec && (rec.status === 'open' || rec.status === 'ack');
+          publishState(woId || woIdFromUrl(), !!active, active ? rec : null);
+          if (r.json.applied) toast('Client response logged - that item is closed ✓', 7000);
+        }
+      })
+      .catch(function () { });
   }
 
   // ---- Drawer ---------------------------------------------------------------
