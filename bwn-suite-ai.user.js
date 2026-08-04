@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - AI (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.42.3
+// @version      1.42.4
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-ai.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-ai.user.js
 // @description  The Umbrava tools that call outside APIs, kept separate from the zero-egress Core script. Client Update and WO Audit drafts (Anthropic Claude; draft-only, scrubbed before sending, you review before posting); Find Techs / Find Suppliers (Google Places; vendor leads near a WO); and Job View (opens the Ops-Dashboard job card on the WO page - WO details from Umbrava plus the authored case file and next actions, read-only). Network access is limited by the browser to the declared API hosts and the BWN Static Web App. API keys are stored in Tampermonkey's storage via the menu commands and never enter the page. Toggle modules in BWN_MODULES below.
@@ -97,6 +97,25 @@
         sessionStorage.setItem('bwn:wo:' + id, JSON.stringify(data));
         document.dispatchEvent(new CustomEvent('bwn:update', { detail: { id: id } }));
       } catch (e) { /* storage full or blocked: bus is best-effort */ }
+    }
+    // MERGE a partial payload over whatever is already on the bus, instead of replacing it.
+    // For publishing header identity before the full WO state is computable: a consumer that
+    // reads early gets the real Tracking # rather than nothing, and a later full busPut still
+    // overwrites everything. BLANKS ARE SKIPPED - a field the header has not rendered yet must
+    // never clobber a good value from an earlier pass. Clearing a field is the full publish's
+    // job, since only it knows the difference between "not read yet" and "genuinely empty".
+    function busPatch(id, data) {
+      try {
+        var cur = null;
+        try { var raw = sessionStorage.getItem('bwn:wo:' + id); cur = raw ? JSON.parse(raw) : null; } catch (e) { cur = null; }
+        if (!cur || typeof cur !== 'object' || cur.v !== 1) cur = {};
+        for (var k in data) {
+          if (!Object.prototype.hasOwnProperty.call(data, k)) continue;
+          if (data[k] === '' || data[k] == null) continue;
+          cur[k] = data[k];
+        }
+        busPut(id, cur);
+      } catch (e) { /* bus is best-effort */ }
     }
     function busHeatGet(id, maxAgeMs) {
       try {
@@ -686,7 +705,7 @@
 
     return {
       VERSION: VERSION,
-      woId: woId, busGet: busGet, busPut: busPut, busHeatGet: busHeatGet, busVendors: busVendors,
+      woId: woId, busGet: busGet, busPut: busPut, busPatch: busPatch, busHeatGet: busHeatGet, busVendors: busVendors,
       CFG_DEFAULTS: CFG_DEFAULTS, cfg: cfg, cfgSave: cfgSave,
       money: money, parseMoney: parseMoney, parseBare: parseBare, parseUSDate: parseUSDate,
       alphaOnly: alphaOnly, lcsLen: lcsLen,
