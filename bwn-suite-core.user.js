@@ -5633,15 +5633,16 @@
 
     // Record a captured list query. THE REQUEST ALONE IS ENOUGH (v3.18).
     // v3.15-3.17 only latched when the RESPONSE body could be read, via
-    // `res.clone().json()` in the hook below. Measured on the live board 2026-08-04: the
-    // app aborts its own fetches on teardown, so every clone read of every operation
-    // rejected with AbortError - the board query included. apiList therefore stayed null
-    // forever, which meant no API scan, no auto-scan, and a "Scan All" button that always
-    // ran the slow scroll sweep. That is the whole reason the overlay still demanded a
-    // full scan on arrival. The request body carries the query text and the filters, which
-    // is everything the replay needs; a response, when one does survive, only UPGRADES the
-    // capture with the row path and a sample. The replay validates the shape either way,
-    // so a wrong guess falls back honestly instead of reporting a partial board.
+    // `res.clone().json()` in the hook below. That is a RACE, not a read: the app aborts
+    // its own fetches on teardown, and a clone only buffers while someone is still
+    // reading it. Measured 2026-08-04 - with one more clone reader on the same responses,
+    // EVERY clone read of EVERY operation rejected with AbortError and apiList stayed
+    // null for the whole session, so nothing could scan; alone, the same read usually
+    // wins. A latch that works only when nothing else is listening is not a latch. The
+    // request body carries the query text and the filters, which is everything the replay
+    // needs, and it is ours synchronously; a response, when one does survive, only
+    // UPGRADES the capture with the row path and a sample. The replay validates the shape
+    // either way, so a wrong guess falls back honestly instead of reporting a partial board.
     function heatRecordCapture(reqBody, data) {
       if (heatReplaying) return;   // don't re-capture our own enlarged replay pages
       // (v3.16) The board query only fires on the WO-list route. A WO-details page fires
@@ -5713,8 +5714,8 @@
             var body = (init && init.body) || (input && input.body) || null;
             var p = of.apply(this, arguments);
             if (isGqlUrl(url) && body) {
-              // Latch off the REQUEST first (v3.18): the clone read below loses a race with
-              // the app's own teardown almost every time, so it cannot be the only path.
+              // Latch off the REQUEST first (v3.18): the clone read below is a race against
+              // the app's own teardown, so it cannot be the only path.
               try { heatRecordCapture(body, null); } catch (e) { }
               try {
                 p.then(function (res) {
