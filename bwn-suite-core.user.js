@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.25
+// @version      1.66.26
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -852,19 +852,64 @@
     ACTIVE_RE: /scheduled|in progress|dispatch|on[\s-]?site/i,
     BLOCKED_RE: /pending materials|awaiting 3rd|third party|client action|awaiting proposal|awaiting po|on hold/i,
     BLOCKED_MULT: 1.0,
-    PRIO_MULT: { 1: 0.25, 2: 0.5, 3: 1.0, 4: 1.5 }
+    PRIO_MULT: { 1: 0.25, 2: 0.5, 3: 1.0, 4: 1.5 },
+    // Normalized priority tier off the row's own `priority.category` - measured live
+    // 2026-08-04 as "Emergency" | "High" | "Standard". This matters because the P1..P4
+    // parse below only fires on a "P<n>"-shaped label, and MOST clients do not use one:
+    // "SEV 4", "STANDARD-2 BUSINESS DAYS", "Normal", "Unknown", "High (within 4-24 hrs)"
+    // and "Emergency Life/Safety/Operations: Same Day Service" are all real live labels
+    // and every one of them fell through to a neutral 1.0. Priority scaling was silently
+    // inert for most of the board; only Pilot's "P2 Next Day"-style labels ever scaled.
+    CAT_MULT: { emergency: 0.25, high: 0.5, standard: 1.0 },
+    // Response-clock basis: `priority.responseMinutes` IS the client's own promise, in
+    // minutes, per WO. Scaled against a 24h day, then clamped - one absurd SLA must not
+    // pin a row permanently red (floor) or permanently quiet (ceiling).
+    RESP_BASE_MIN: 1440, RESP_MULT_MIN: 0.25, RESP_MULT_MAX: 2.0
   };
   function bwnPrioNum(prioText) { var m = String(prioText || '').match(/p\s*([1-4])/i); return m ? +m[1] : null; }
   function bwnPrioMult(prioText) { var pn = bwnPrioNum(prioText); return (pn && BWN_HEAT_CFG.PRIO_MULT[pn]) || 1; }
-  function bwnThresholdsFor(status, prioText, C) {
+  // The multiplier the row's OWN SLA facts imply, or null when there are none. Best
+  // evidence first: a real response clock in minutes, then the normalized category, then
+  // nothing (so the caller falls back to the label parse). Never guesses harsher.
+  function bwnSlaMult(sla) {
+    if (!sla) return null;
+    var rm = Number(sla.responseMinutes);
+    if (isFinite(rm) && rm > 0) {
+      return Math.max(BWN_HEAT_CFG.RESP_MULT_MIN,
+        Math.min(BWN_HEAT_CFG.RESP_MULT_MAX, rm / BWN_HEAT_CFG.RESP_BASE_MIN));
+    }
+    var cat = String(sla.category || '').trim().toLowerCase();
+    if (BWN_HEAT_CFG.CAT_MULT[cat] !== undefined) return BWN_HEAT_CFG.CAT_MULT[cat];
+    return null;
+  }
+  // `sla` is OPTIONAL and purely additive: { responseMinutes, category } straight off the
+  // row's `priority` object. Every existing caller passes three args and behaves exactly
+  // as before - WO Assist's header read and List Heat's DOM scan have no SLA facts, so the
+  // mature live-tested path is untouched. Only the API scan, which does have them, scales
+  // off the client's real clock instead of a string parsed out of a display label.
+  function bwnThresholdsFor(status, prioText, C, sla) {
     C = C || BWN.cfg();
     var mult = 1.0;
     if (BWN_HEAT_CFG.ACTIVE_RE.test(status)) mult *= C.activeMult;
     else if (BWN_HEAT_CFG.BLOCKED_RE.test(status)) mult *= BWN_HEAT_CFG.BLOCKED_MULT;
-    var pn = bwnPrioNum(prioText);
-    if (pn && BWN_HEAT_CFG.PRIO_MULT[pn]) mult *= BWN_HEAT_CFG.PRIO_MULT[pn];
-    return { warn: C.hrsWarn * mult, bad: C.hrsBad * mult };
+    var sm = bwnSlaMult(sla);
+    if (sm !== null) mult *= sm;
+    else {
+      var pn = bwnPrioNum(prioText);
+      if (pn && BWN_HEAT_CFG.PRIO_MULT[pn]) mult *= BWN_HEAT_CFG.PRIO_MULT[pn];
+    }
+    return { warn: C.hrsWarn * mult, bad: C.hrsBad * mult, sla: sm !== null };
   }
+
+  // ---- Next-actions engine, published across module closures -------------------
+  // `computeNextActions` is a PURE fn but it lives inside the WO Assist module's IIFE
+  // together with its taxonomy (WO_PHASE, scoreAct, ACT_*), and List Heat is a separate
+  // IIFE - so the audit could not reach it. The engine registers itself here at its point
+  // of definition rather than being moved: moving a mature, live-tested engine (and its
+  // dependency graph) to file level is a far bigger change than publishing a reference.
+  // Stays null if the WO Assist module is disabled by config, and every consumer must
+  // null-guard - the audit then simply shows no next step instead of a wrong one.
+  var bwnActsEngine = null;
 
   // ---- File-level same-origin GraphQL (shared by WO Assist reads + List Heat) --
   // @grant none: a plain SAME-ORIGIN POST to /api/graphql carries the app's Auth0
@@ -2900,6 +2945,11 @@
       acts.sort(function (x, y) { return scoreAct(y, state) - scoreAct(x, state); });   // worst-first (stable); objective + nudge pressure, never habit-softened
       return acts;   // callers cap the display; the checklist wants the full list
     }
+    // Publish the pure engine to file level so List Heat's audit can rank a board row's
+    // next step with the SAME playbook the WO page uses (see bwnActsEngine's comment).
+    // The PURE fn only - never the `nextActions` wrapper, which has DOM reads and a
+    // localStorage side effect (stagePlanPush) that must not fire 200 times per scan.
+    bwnActsEngine = computeNextActions;
 
     // ---- Action Checklist (inline card above Purchase Orders) -----------------
     // The playbook as a WORKING surface: a card embedded in the WO page directly
@@ -5489,7 +5539,7 @@
   });
 
   // ==========================================================================
-  // MODULE: WO List Heat v3.18
+  // MODULE: WO List Heat v3.19
   // ==========================================================================
   if (BWN_MODULES.listHeat) BWN.safeModule('listHeat', function () {
     'use strict';
@@ -5500,7 +5550,7 @@
     }
     window.__bwnWoHeat = true;
 
-    console.info('[BWN HEAT] v3.18 loaded on', location.href);
+    console.info('[BWN HEAT] v3.19 loaded on', location.href);
 
     // ---- Config (edit here) ----------------------------------------------
     // Advanced knobs (status-class regexes + priority multipliers) now live in the
@@ -5732,6 +5782,15 @@
           Object.keys(val).forEach(function (k2) { if (k2 !== '__typename' && (val[k2] == null || typeof val[k2] !== 'object')) flat[k + '.' + k2] = val[k2]; });
         } else if (Array.isArray(val)) {
           if (val.length && val[0] && typeof val[0] === 'object' && 'name' in val[0]) flat[k + '.name'] = val.map(function (x) { return x && x.name; }).filter(Boolean).join(', ');
+          // A list of PLAIN STRINGS was dropped entirely - the branch above only handled
+          // arrays of objects, so `vendorNames` (measured live: ["FACE N SON'S LLC", ...])
+          // never reached the row at all and "scheduled, but nobody assigned to it" was
+          // unreadable. The key is set even for an EMPTY array, because the difference
+          // between "no vendor" and "vendor list not selected" is the whole signal - the
+          // reader below tests key PRESENCE, not truthiness.
+          else if (val.every(function (x) { return x == null || typeof x !== 'object'; })) {
+            flat[k] = val.map(function (x) { return x == null ? '' : String(x); }).filter(Boolean).join(', ');
+          } else flat[k] = '';
         } else { flat[k] = val; }
       });
       return flat;
@@ -5741,6 +5800,35 @@
       if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(String(v))) return String(v);
       var d = new Date(v); if (isNaN(+d)) return '';
       return (d.getMonth() + 1) + '/' + d.getDate() + '/' + d.getFullYear();
+    }
+    // A GUID is an ID. It is never a display name, whatever its key is called.
+    // Umbrava's list row carries BOTH `assignedTo` (an ID scalar) AND
+    // `assignedToMemberName` ("Daniel Russell") - measured live 2026-08-04 - and g()
+    // returns the FIRST key its regex matches, so the ID key won the assignee slot and
+    // every audit bucket, every heat-dim filter and every TSV row was labelled with a
+    // GUID. Exactly the v3.18 `priority.__typename` lesson again: match on the VALUE's
+    // shape, not on the key name alone. Kept as a value test rather than a key blocklist
+    // because the next id-shaped field to appear will have a name nobody predicted.
+    var HEAT_GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    function heatIsGuid(v) { return HEAT_GUID_RE.test(String(v == null ? '' : v).trim()); }
+    // Money arrives in MINOR UNITS carrying its own `precision`: live 2026-08-04,
+    // doNotExceed = { amount: 1448564, currency: 'USD', precision: 2 } = $14,485.64.
+    // BWN.money() only FORMATS a number - it does not scale - so the API scan rendered
+    // every DNE 100x over ("$1,448,564.00"), on every row, in the panel and the TSV both.
+    // The old harness fixture used a FRACTIONAL amount (89871.1), which is not a shape the
+    // server can emit, so the test agreed with the bug instead of catching it. The DOM path
+    // was never wrong here: it reads the cell text the SPA already formatted.
+    // Returns a number in major units, or null when there is nothing readable.
+    function moneyNum(amt, prec) {
+      if (amt === '' || amt == null) return null;
+      if (typeof amt === 'string' && /[$,]/.test(amt)) {   // already formatted upstream
+        var pm = BWN.parseMoney(amt); return pm === null ? BWN.parseBare(amt) : pm;
+      }
+      var n = parseFloat(amt);
+      if (isNaN(n)) return null;
+      var p = parseInt(prec, 10);
+      if (!isFinite(p) || p < 0 || p > 6) p = 0;   // no precision key -> already major units
+      return n / Math.pow(10, p);
     }
     function heatApiRowToEntry(row) {
       var flat = heatFlatten(row);
@@ -5753,15 +5841,77 @@
       // emit nextOnsiteDate before priority.firstTripDate today; that is luck, not a
       // contract, and getting it wrong silently moves the "sched date passed" verdict.
       function gPref(list) { for (var i = 0; i < list.length; i++) { var v = g(list[i]); if (v !== '') return v; } return ''; }
+      // Like g(), but refuses a GUID value outright, and like gPref() tries the patterns
+      // in preference order. Used for anything that must be HUMAN-READABLE.
+      function gName(list) {
+        for (var i = 0; i < list.length; i++) {
+          for (var j = 0; j < keys.length; j++) {
+            if (!list[i].test(keys[j])) continue;
+            var v = flat[keys[j]];
+            if (v != null && v !== '' && !heatIsGuid(v)) return v;
+          }
+        }
+        return '';
+      }
+      // Key PRESENCE, regardless of value. An empty `vendorNames: []` is a fact ("no
+      // vendor on this WO"); an absent key is the absence of a fact ("column not read").
+      function has(re) { for (var i = 0; i < keys.length; i++) if (re.test(keys[i])) return true; return false; }
       var numRaw = g(/(^|\.)(workordernumber|number)$/i);
       var num = String(numRaw).replace(/\D/g, '');
       if (!num) return null;
       var status = String(g(/statusname|(^|\.)status(\.(name|label))?$|workorderstatus/i) || '');
       var prio = String(g(/priority.*(label|name)|(^|\.)priority$/i) || '');
       var client = String(g(/(^|\.)(clientname|customername|client|customer)(\.(name))?$|accountname/i) || g(/locationname/i) || '');
-      var assignee = String(g(/assigned.*(to|user|name)|assignee|coordinator|owner.*name/i) || '');
-      var dne = g(/donotexceed.*amount|(^|\.)dne$|(^|\.)nte$|notexceed/i);
-      var hrs = g(/timeinstatus|hoursinstatus|hrsinstatus|statushours|statushrs/i);
+      // Name-shaped keys first, then the old broad pattern (now GUID-proof), then the
+      // two-part case: `assignedTo { firstName lastName }` flattens to two keys and
+      // neither one is the whole name, so g() would have returned just the first name.
+      // WHOLE-name keys, anchored and spelled out. An unanchored `assigned.*to.*name` reads
+      // as "assignedToMemberName" to a human but it also matches `assignedTo.firstName`, so
+      // it took the first name and the join below never got a turn.
+      var assignee = gName([/(^|\.)(assignedtomembername|assignedtoname|assigneename|assigneedisplayname|coordinatorname|coordinatormembername|ownername|membername|displayname|fullname)$/i]);
+      // The two-part case comes BEFORE the broad fallback, not after it: the broad pattern
+      // matches `assignedTo.firstName` on its own, so trying it first returned "Daniel" -
+      // truthy, so the join never ran, and the surname was silently dropped. Caught by the
+      // harness, not by reading the code.
+      if (!assignee) {
+        var fn = gName([/(first|given)name$/i]), ln = gName([/(last|family|sur)name$/i]);
+        assignee = (fn + ' ' + ln).replace(/\s+/g, ' ').trim();
+      }
+      if (!assignee) assignee = gName([/assigned.*(to|user|name)|assignee|coordinator/i]);
+      // The GUID is still worth keeping: it is what resolves a name (and `isInactive`)
+      // through the proven user(id:) query when the board query carries no name field -
+      // which is what happens whenever the Assigned To column is not in view.
+      var assigneeId = String(g(/(^|\.)assigned(to|touserid|tomemberid|userid|memberid)$|(^|\.)assigneeid$|(^|\.)coordinatorid$/i) || '');
+      if (!heatIsGuid(assigneeId)) assigneeId = '';
+      // `doNotExceed` flattens to `doNotExceed.amount` + `doNotExceed.precision`, so the
+      // amount patterns are anchored: an unanchored `.*amount` would be fine but
+      // `notexceed` alone also matched the PRECISION key, and dropping the bare-object case
+      // broke a board that returns a plain number. Both shapes are matched explicitly and
+      // neither pattern can reach a `.precision` key. DNE and NTE are read SEPARATELY now -
+      // conflating them (the old regex let a totalNTE key fill the DNE slot) would make the
+      // "vendor NTE over DNE" comparison compare a number with itself.
+      var dne = g(/donotexceed\.amount$|(^|\.)donotexceed$|(^|\.)dne$|notexceed\.amount$/i);
+      var nte = g(/totalnte\.amount$|(^|\.)totalnte$|(^|\.)nte$/i);
+      // `timeInStatus` is MINUTES. Measured against the live board 2026-08-04, three ways,
+      // none of them inferred from a name:
+      //   - it returned 81001 for a WO created 137 days earlier. Total age is 3288 hours,
+      //     so the value cannot BE hours - 81001h is 9.2 years.
+      //   - 311 of the 340 zero-day-old open WOs read above 24. Hours is impossible again.
+      //   - not one WO tenant-wide exceeds 1,000,000, which rules out seconds too: a WO
+      //     75 days in one status would be 6.5M.
+      //   81001/60 = 1350h = 56d, which agrees with that row's own dates.
+      // The DOM column is hours and the whole threshold model (hrsWarn/hrsBad -> 60/120/240)
+      // is in hours, so every API-scanned row was judged against a 60x-inflated clock. That
+      // is what "red 217 of 242" was: 90% of the board red, the audit's counts, the offender
+      // ranking, the My Day pills and the daily trend snapshot all wrong together.
+      // Units are read as SEPARATE keys rather than converted by a heuristic: a key that
+      // says "hours" is trusted as hours, so if the schema ever emits an hours field no
+      // guess is needed and nothing silently double-converts.
+      var hrsHours = g(/hours?instatus|hrsinstatus|statushours|statushrs/i);
+      var hrsMinutes = g(/timeinstatus|minutesinstatus|statusminutes/i);
+      var hrs = '';
+      if (hrsHours !== '' && !isNaN(parseFloat(hrsHours))) hrs = String(Math.round(parseFloat(hrsHours) * 10) / 10);
+      else if (hrsMinutes !== '' && !isNaN(parseFloat(hrsMinutes))) hrs = String(Math.round(parseFloat(hrsMinutes) / 6) / 10);
       var days = g(/(^|\.)(age|days|daysopen|daysold|numberofdays)$|agedays/i);
       var created = g(/workorderdate|creationdate|createddate|datecreated|createdon/i);
       var exp = g(/expectedcompletion|completeby|completiondate/i);
@@ -5770,13 +5920,38 @@
       var ageStr = '';
       if (days !== '' && !isNaN(parseFloat(String(days).replace(/,/g, '')))) ageStr = String(Math.round(parseFloat(String(days).replace(/,/g, ''))));
       else if (created) { var ct = BWN.parseUSDate(heatDateStr(created)); if (ct !== null) ageStr = String(dSince(ct)); }
+      // The server's OWN overdue clock, in days, signed (live: remainingDays -88 on a WO
+      // whose expectedCompletionDate had passed 88 days earlier - they agree exactly). It
+      // is the fallback for the overdue verdict when the Expected Completion column is not
+      // in view, which today turns the whole overdue check off for the entire board.
+      var remRaw = g(/remainingdays|(^|\.)daysremaining$/i);
+      var remDays = (remRaw !== '' && !isNaN(parseFloat(remRaw))) ? parseFloat(remRaw) : null;
+      var phase = String(g(/(^|\.)phase$|lifecyclephase|systemstatusname/i) || '');
+      // Vendors: the value AND whether the field was read at all (see has()).
+      var vendorsKnown = has(/vendornames?$|(^|\.)vendors$|vendor\.name$/i);
+      var vendors = String(g(/vendornames?$|(^|\.)vendors$|vendor\.name$/i) || '');
+      // SLA facts, straight off the row's own priority object - no parsing of display text.
+      var respMin = g(/responseminutes/i);
+      var slaMin = g(/servicelevelagreementminutes|slaminutes/i);
+      var prioCat = String(g(/priority.*category|(^|\.)prioritycategory$/i) || '');
+      var dneAmt = moneyNum(dne, g(/donotexceed.*precision/i));
+      var nteAmt = moneyNum(nte, g(/totalnte.*precision/i));
       return {
         href: '/work-orders/' + num,
         entry: {
           id: num, wo: String(numRaw), tracking: String(g(/trackingnumber|(^|\.)tracking$/i) || '').replace(/\D+/g, ''),
           status: status, prio: prio, client: client, assignee: cleanName(assignee),
-          hrs: (hrs === '' ? '' : String(hrs)), days: ageStr,
-          dne: (dne === '' ? '' : (typeof dne === 'number' ? BWN.money(dne) : String(dne))),
+          assigneeId: assigneeId,
+          hrs: hrs, days: ageStr,
+          dne: (dneAmt === null ? '' : BWN.money(dneAmt)),
+          nte: (nteAmt === null ? '' : BWN.money(nteAmt)),
+          dneAmt: dneAmt, nteAmt: nteAmt,
+          phase: phase, vendors: vendors, vendorsKnown: vendorsKnown, remDays: remDays,
+          sla: {
+            responseMinutes: (respMin !== '' && !isNaN(parseFloat(respMin))) ? parseFloat(respMin) : null,
+            slaMinutes: (slaMin !== '' && !isNaN(parseFloat(slaMin))) ? parseFloat(slaMin) : null,
+            category: prioCat
+          },
           sched: heatDateStr(sched), lastNote: heatDateStr(lastNote), exp: heatDateStr(exp)
         }
       };
@@ -5958,6 +6133,9 @@
         '#bwn-heat-panel .orow a{font:500 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;color:var(--bwn-green);text-decoration:none;white-space:nowrap;}' +
         '#bwn-heat-panel .orow .cl{color:var(--bwn-text-muted);white-space:nowrap;}' +
         '#bwn-heat-panel .orow .rs{color:var(--bwn-bad-fg);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
+        // The next step is the prescription, not the symptom: green, and it must not
+        // compete with .rs for the flexible width (the reasons stay the truncating one).
+        '#bwn-heat-panel .orow .ns{flex:none;max-width:34%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--bwn-green);font-weight:500;}' +
         '#bwn-heat-panel .pf{display:flex;gap:8px;justify-content:flex-end;padding:10px 14px;background:var(--bwn-surface-2);border-top:1px solid var(--bwn-border-2);}' +
         '#bwn-heat-panel .pf .hint{margin-right:auto;font:10px ui-monospace,"Segoe UI Mono","SF Mono",monospace;color:var(--bwn-text-faint);align-self:center;}' +
         '#bwn-heat-panel button{padding:7px 14px;border:none;border-radius:8px;cursor:pointer;font:500 12px -apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;color:var(--bwn-green);background:var(--bwn-tint);}' +
@@ -6218,15 +6396,21 @@
     //           noteAge (days | null) }. A done/closed status is always sev 0.
     function computeVerdict(f, C) {
       var reasons = [], kinds = [], sev = 0;
-      var v = { sev: 0, reasons: reasons, kinds: kinds, over30: false, limitBad: false, limitWatch: false, stale: false, noteAge: null };
+      var v = { sev: 0, reasons: reasons, kinds: kinds, over30: false, limitBad: false, limitWatch: false, stale: false, noteAge: null, slaScaled: false };
       function bump(level, msg, kind) {
         if (level > sev) sev = level;
         reasons.push(msg);
         if (kind && kinds.indexOf(kind) === -1) kinds.push(kind);
       }
       if (/complete|invoiced|closed|cancel/i.test(f.status || '')) return v;
+      // `phase` is the server's own lifecycle field and it is authoritative where the
+      // status NAME is free text: a custom terminal status nobody predicted still carries
+      // a terminal phase. Additive - the status regex above keeps its existing behaviour,
+      // and this only ever ADDS reasons to fall silent, never new alarms.
+      if (/^(closed|cancel|canceled|cancelled|declined|revoked)/i.test(String(f.phase || '').trim())) return v;
       v.over30 = !isNaN(f.ageDays) && f.ageDays > 30;
-      var th = thresholdsFor(f.status, f.prio, C);
+      var th = thresholdsFor(f.status, f.prio, C, f.sla);
+      v.slaScaled = !!th.sla;
       if (!isNaN(f.hrs)) {
         if (f.hrs >= th.bad) { bump(2, Math.round(f.hrs) + 'h in "' + (f.status || '?') + '" (limit ' + Math.round(th.bad) + 'h)', 'limitbad'); v.limitBad = true; }
         else if (f.hrs >= th.warn) { bump(1, Math.round(f.hrs) + 'h in "' + (f.status || '?') + '" (watch from ' + Math.round(th.warn) + 'h)', 'limitwatch'); v.limitWatch = true; }
@@ -6235,6 +6419,12 @@
         var dd = dUntil(f.expTs);
         if (dd < 0) bump(2, 'complete-by overdue ' + Math.abs(dd) + 'd', 'overdue');
         else if (dd <= C.dueWarnDays) bump(1, 'due in ' + dd + 'd', 'duesoon');
+      } else if (typeof f.remDays === 'number' && isFinite(f.remDays)) {
+        // No complete-by date to read - use the server's signed day count instead, so the
+        // overdue check survives the Expected Completion column being out of view. Same
+        // kinds, so a snooze taken on one basis still holds on the other.
+        if (f.remDays < 0) bump(2, 'complete-by overdue ' + Math.abs(Math.round(f.remDays)) + 'd', 'overdue');
+        else if (f.remDays <= C.dueWarnDays) bump(1, 'due in ' + Math.round(f.remDays) + 'd', 'duesoon');
       }
       if (f.schedTs !== null && f.schedTs !== undefined) {
         var over = dSince(f.schedTs);
@@ -6245,9 +6435,211 @@
         v.noteAge = quiet;
         if (quiet > C.noteStaleDays) { bump(1, 'last note ' + quiet + 'd ago', 'stale'); v.stale = true; }
       }
+      // ---- Signals the board already returned and the audit ignored -----------------
+      // Each one needs a fact the DOM scan does not have, so each is skipped (never
+      // guessed) when its input is absent - the same do-its-best rule the column checks use.
+      //
+      // 1. Nobody assigned to do the work. Only fires on a status that means a vendor is
+      //    already COMMITTED - scheduled, on site, materials moving. "Pending Dispatch" and
+      //    "Pending Schedule" are excluded on purpose: having no vendor yet is their normal
+      //    resting state, and flagging them would put a third of the board in amber.
+      if (f.vendorsKnown && !String(f.vendors || '').trim() &&
+        /scheduled|in progress|on[\s-]?site|material (ordered|received)|vendor (proposal|invoice)/i.test(f.status || '') &&
+        !/^pending\s/i.test(String(f.status || '').trim())) {
+        bump(1, 'no vendor on a "' + f.status + '" WO', 'novendor');
+        v.noVendor = true;
+      }
+      // 2. Committed vendor cost above what the client authorized. DNE is the client's
+      //    not-to-exceed; totalNTE is the vendor-cost total (both minor units, scaled by
+      //    heatApiRowToEntry). Over it is a money-control breach, not a timing problem, so
+      //    it is red on its own. Requires BOTH numbers - never inferred from one.
+      if (typeof f.dneAmt === 'number' && typeof f.nteAmt === 'number' && f.dneAmt > 0 && f.nteAmt > f.dneAmt) {
+        bump(2, 'vendor NTE ' + BWN.money(f.nteAmt) + ' over DNE ' + BWN.money(f.dneAmt), 'nteover');
+        v.nteOver = true;
+      }
+      // 3. Assigned to a deactivated account - an orphaned WO nobody is actually working.
+      //    Resolved from the assignee GUID after the scan (heatResolveAssignees), so it can
+      //    only ever be true, never a guess: unknown stays silent.
+      if (f.assigneeInactive === true) {
+        bump(1, 'assigned to an inactive user' + (f.assignee ? ' (' + f.assignee + ')' : ''), 'orphan');
+        v.orphan = true;
+      }
       v.sev = sev;
       return v;
     }
+
+    // One place that turns a STORED row (API-mapped or DOM-scraped) into verdict facts, so
+    // the scan, the post-resolution re-judge, and any later consumer cannot drift apart on
+    // which fields feed the engine. Absent fields stay absent: `undefined` reaches
+    // computeVerdict as undefined and each check skips itself.
+    function heatVerdictFor(e, C) {
+      return computeVerdict({
+        status: e.status, prio: e.prio, phase: e.phase,
+        ageDays: parseFloat(String(e.days || '').replace(/,/g, '')),
+        hrs: parseFloat(String(e.hrs || '').replace(/,/g, '')),
+        expTs: BWN.parseUSDate(e.exp), schedTs: BWN.parseUSDate(e.sched), lastNoteTs: BWN.parseUSDate(e.lastNote),
+        remDays: e.remDays, sla: e.sla,
+        vendors: e.vendors, vendorsKnown: e.vendorsKnown,
+        dneAmt: e.dneAmt, nteAmt: e.nteAmt,
+        assignee: e.assignee, assigneeInactive: e.assigneeInactive
+      }, C || bwnConfig());
+    }
+
+    // ---- Assignee names from GUIDs ------------------------------------------------
+    // The board row carries `assignedToMemberName` only when the Assigned To column is in
+    // view - the captured query selects what the column chooser asked for. When it is not,
+    // all we have is the `assignedTo` GUID, and a GUID must never reach the panel. So:
+    // resolve the DISTINCT ids through user(id:) - the same query bwn-dispatch proved live
+    // on 2026-08-03, which also carries `isInactive` and so pays for a second signal.
+    // A board has a handful of coordinators, not hundreds, and the result is cached for the
+    // tab, so a rescan costs nothing. Aliased into ONE document per chunk; a chunk that
+    // errors degrades to single reads; an id that cannot be read is remembered as
+    // unresolvable so it is not retried all session.
+    var HEAT_USER_Q_MAX = 20;
+    var heatUserCache = {};        // guid -> { name, inactive } | null (tried, unreadable)
+    function heatUserCacheLoad() {
+      try {
+        var raw = sessionStorage.getItem('bwn:heat:users');
+        var o = raw ? JSON.parse(raw) : null;
+        if (o && typeof o === 'object') Object.keys(o).forEach(function (k) { if (!(k in heatUserCache)) heatUserCache[k] = o[k]; });
+      } catch (e) { /* best-effort */ }
+    }
+    function heatUserCacheSave() {
+      try { sessionStorage.setItem('bwn:heat:users', JSON.stringify(heatUserCache)); } catch (e) { /* best-effort */ }
+    }
+    function heatUserChunk(ids) {
+      var decl = ids.map(function (_, i) { return '$i' + i + ':ID!'; }).join(',');
+      var sel = ids.map(function (_, i) { return 'u' + i + ': user(id:$i' + i + '){ firstName lastName isInactive }'; }).join(' ');
+      var vars = {};
+      ids.forEach(function (id, i) { vars['i' + i] = id; });
+      return heatGql('query(' + decl + '){ ' + sel + ' }', vars).then(function (d) {
+        ids.forEach(function (id, i) { heatUserCache[id] = heatUserRec((d || {})['u' + i]); });
+      }, function () {
+        // One bad id rejects the whole GraphQL document, so fall back to single reads
+        // rather than writing off every coordinator in the chunk.
+        return Promise.all(ids.map(function (id) {
+          return heatGql('query($id:ID!){ user(id:$id){ firstName lastName isInactive } }', { id: id })
+            .then(function (d) { heatUserCache[id] = heatUserRec(d && d.user); },
+              function () { heatUserCache[id] = null; });
+        }));
+      });
+    }
+    function heatUserRec(u) {
+      if (!u) return null;
+      var nm = ((u.firstName || '') + ' ' + (u.lastName || '')).replace(/\s+/g, ' ').trim();
+      if (!nm) return null;
+      return { name: nm, inactive: u.isInactive === true };
+    }
+    // Fills in `assignee` / `assigneeInactive` on every row that has an id but no name, then
+    // RE-JUDGES those rows - the inactive-user signal is a verdict input, so a name arriving
+    // late must be able to change sev. Resolves to the number of rows changed.
+    function heatResolveAssignees(store) {
+      if (!store) return Promise.resolve(0);
+      heatUserCacheLoad();
+      var hrefs = Object.keys(store), need = {}, ids = [];
+      hrefs.forEach(function (h) {
+        var e = store[h];
+        if (!e || !e.assigneeId || e.assignee) return;
+        need[h] = e.assigneeId;
+        if (heatUserCache[e.assigneeId] === undefined && ids.indexOf(e.assigneeId) === -1) ids.push(e.assigneeId);
+      });
+      var pending = Object.keys(need);
+      if (!pending.length) return Promise.resolve(0);
+      if (!heatAuthToken()) return Promise.resolve(heatApplyUsers(store, need));
+      var chunks = [];
+      for (var i = 0; i < ids.length; i += HEAT_USER_Q_MAX) chunks.push(ids.slice(i, i + HEAT_USER_Q_MAX));
+      return chunks.reduce(function (p, c) {
+        return p.then(function () { return heatUserChunk(c); });
+      }, Promise.resolve()).then(function () {
+        heatUserCacheSave();
+        var n = heatApplyUsers(store, need);
+        var unres = 0;
+        Object.keys(need).forEach(function (h) { if (store[h] && !store[h].assignee) unres++; });
+        console.info('[BWN HEAT] assignee names: ' + (pending.length - unres) + ' of ' + pending.length +
+          ' resolved from ' + ids.length + ' distinct id(s)' + (unres ? ' | ' + unres + ' unresolved' : ''));
+        return n;
+      }, function (err) {
+        console.warn('[BWN HEAT] assignee name resolution failed - buckets will read "(unresolved member)":', (err && err.message) || err);
+        return heatApplyUsers(store, need);
+      });
+    }
+    function heatApplyUsers(store, need) {
+      var C = bwnConfig(), n = 0;
+      Object.keys(need).forEach(function (h) {
+        var e = store[h]; if (!e) return;
+        var rec = heatUserCache[need[h]];
+        if (rec && rec.name) { e.assignee = cleanName(rec.name); e.assigneeInactive = rec.inactive; }
+        // A GUID must not reach the panel even when the read failed. This label is
+        // deliberately NOT "(blank)": "we could not read who owns this" and "nobody owns
+        // this" are different facts and an audit that conflates them is lying quietly.
+        else e.assignee = '(unresolved member)';
+        var vf = heatVerdictFor(e, C);
+        e.sev = vf.sev; e.reasons = vf.reasons.slice(); e.kinds = vf.kinds.slice();
+        e.acked = vf.sev > 0 ? ackGet(e.id, vf.kinds) : false;
+        n++;
+      });
+      return n;
+    }
+
+    // ---- Next step per row (the playbook, run over board fields only) -------------
+    // Ranks the SAME playbook the WO page uses, from the only facts a board row has. The
+    // engine's PO / trip / IVR / document / note steps cannot fire here - there is no such
+    // data in a list row - so this answers "what does the playbook say from status, priority,
+    // clock and dates alone", which is exactly the top of the list for a stuck WO.
+    //
+    // WHAT EACH ABSENT INPUT IS PASSED AS, and why it is not one blanket rule. The engine was
+    // written for a WO page where every field is present, so this was audited branch by branch:
+    //   pos: []      - the ONLY field the engine dereferences unguarded (`state.pos.forEach`).
+    //                  `null` throws, and because the call is wrapped in a try/catch that
+    //                  throw would be silent - a dead column that still looked green. `[]` is
+    //                  safe HERE specifically: no branch treats "no POs" as EVIDENCE for a
+    //                  step. The four PO steps are emitted from inside forEach/filter, so an
+    //                  empty list emits none, and the two `some()` branches only SUPPRESS.
+    //   docs: null   - NOT `{count: 0}`. The docs branch fires on `docs.count === 0`, so a
+    //                  zero count would fabricate "no documents on file" on every WO at
+    //                  closure. Unread must not read as empty. `null` is guarded and silent.
+    //   openTasks    - null; guarded (`state.openTasks && .count > 0`), and it is an object,
+    //                  not an array.
+    //   noShow/stall - null; both guarded, and both are trip-derived facts a row cannot have.
+    //   money        - null, never 0: `gpPct: 0` would read as 0% GP and fire a red DNE step.
+    function heatNextStep(e, C) {
+      if (typeof bwnActsEngine !== 'function') return null;
+      var expTs = BWN.parseUSDate(e.exp);
+      var due = null;
+      if (expTs !== null) {
+        var dd = dUntil(expTs);
+        due = dd < 0
+          ? { kind: 'bad', label: 'Overdue ' + Math.abs(dd) + 'd', detail: 'Complete-by date (' + e.exp + ') has passed.', raw: e.exp }
+          : { kind: dd <= C.dueWarnDays ? 'warn' : 'ok', label: 'Due ' + dd + 'd', detail: 'Complete by ' + e.exp + '.', raw: e.exp };
+      }
+      var hrs = parseFloat(String(e.hrs || '').replace(/,/g, ''));
+      var noteTs = BWN.parseUSDate(e.lastNote);
+      try {
+        var acts = bwnActsEngine({
+          hd: { wo: e.wo ? 'W-' + e.wo : '', tracking: e.tracking || '', location: e.client || '' },
+          status: e.status || '', priority: e.prio || '',
+          hrs: isNaN(hrs) ? null : hrs,
+          due: due,
+          staleDays: noteTs === null ? null : dSince(noteTs),
+          noteCount: null, lastClientNoteDays: null,
+          pos: [], docs: null, openTasks: null, noShow: null, stall: null,
+          gpPct: null, nte: null, vendorTotal: null,
+          authoredPlan: null, nudges: {}, escRank: null,
+          cfg: C
+        }, C);
+        if (!acts || !acts.length) return null;
+        // The engine appends a standing completion anchor to every list; it is a reference,
+        // not a step, so it must never be reported as "the next thing to do".
+        for (var i = 0; i < acts.length; i++) if (acts[i] && !acts[i].anchor) return acts[i];
+        return null;
+      } catch (err) {
+        // A board row is a thinner state than the engine was written for. If it ever throws,
+        // say so once and drop the column - never let the audit die with it.
+        if (!heatActsWarned) { heatActsWarned = true; console.warn('[BWN HEAT] next-step engine declined a board row - column omitted:', (err && err.message) || err); }
+        return null;
+      }
+    }
+    var heatActsWarned = false;
 
     // ---- Heat pass ----------------------------------------------------------------
     var heatStore = null;     // { href: {sev, reasons[], wo, client, status, assignee, prio, hrs, days, dne, sched, lastNote, exp} }
@@ -6542,6 +6934,22 @@
           q2.title = 'Rows the heat/staleness rules cannot judge \u2014 usually a column not in view during the scan.';
           ql.appendChild(q2);
         }
+        // Say WHICH clock judged the board. The two bases give different limits for the
+        // same row, so a number with no stated basis is not a readable audit.
+        var nSla = entries.filter(function (e) { return e.slaScaled; }).length;
+        if (nSla) {
+          var q3 = document.createElement('span');
+          q3.textContent = 'status limits: ' + nSla + ' of ' + entries.length + ' scaled by the client SLA';
+          q3.title = 'Scaled by the WO\u2019s own priority.responseMinutes / category rather than by parsing "P1".."P4" out of the priority label \u2014 most clients do not use a P-number, so those rows used to fall through to a neutral 1.0x.';
+          ql.appendChild(q3);
+        }
+        var nUnres = entries.filter(function (e) { return e.assignee === '(unresolved member)'; }).length;
+        if (nUnres) {
+          var q4 = document.createElement('span');
+          q4.textContent = nUnres + ' assignee' + (nUnres === 1 ? '' : 's') + ' unresolved';
+          q4.title = 'The board returned only an id for these and the user(id:) lookup did not answer. Shown as "(unresolved member)" rather than folded into "(blank)" \u2014 unreadable is not the same as unassigned.';
+          ql.appendChild(q4);
+        }
         panel.appendChild(ql);
       }
 
@@ -6577,7 +6985,11 @@
             .sort(function (a, b) { return b.bad - a.bad || b.tot - a.tot; });
         }
         var cols = document.createElement('div'); cols.className = 'cols';
-        [['By status', 'status'], ['By assignee', 'assignee'], ['By client', 'client']].forEach(function (def) {
+        // "By phase" only appears when the scan actually READ a phase - a fourth column of
+        // "(blank)" off a DOM scan would be worse than no column.
+        var dims = [['By status', 'status'], ['By assignee', 'assignee'], ['By client', 'client']];
+        if (entries.some(function (e) { return !!e.phase; })) dims.push(['By phase', 'phase']);
+        dims.forEach(function (def) {
           var col = document.createElement('div'); col.className = 'col';
           var h4 = document.createElement('h4'); h4.textContent = def[0]; col.appendChild(h4);
           var groups = groupTinted(def[1]).slice(0, 6);
@@ -6618,6 +7030,7 @@
           var h4m = document.createElement('h4');
           h4m.textContent = 'Matching WOs (' + matches.length + ')';
           mt.appendChild(h4m);
+          var Cm = bwnConfig();   // Cn is declared below (hoisted, still undefined here)
           matches.slice(0, 40).forEach(function (e) {
             var row = document.createElement('div'); row.className = 'orow';
             var a = document.createElement('a'); a.href = e._href; a.textContent = e.wo || e._href;
@@ -6626,6 +7039,7 @@
             rs.textContent = e.reasons.length ? e.reasons.join(' \u00b7 ') : (e.hrs ? e.hrs + 'h in status' : '');
             rs.title = rs.textContent;
             row.appendChild(a); row.appendChild(cl); row.appendChild(rs);
+            addNextStep(row, e, Cm);
             addSnooze(row, e);
             mt.appendChild(row);
           });
@@ -6636,6 +7050,24 @@
             more.appendChild(sp); mt.appendChild(more);
           }
           panel.appendChild(mt);
+        }
+
+        // The playbook's own top step for this row, next to the symptom. "What is wrong"
+        // and "what to do about it" were two different tools until now: the reasons came
+        // from the heat model, the step from the WO page. Same engine, one line.
+        // Silent when the engine cannot rank the row from board fields alone - an audit
+        // that invents a next step is worse than one that shows none.
+        function addNextStep(row, e, C) {
+          var act = null;
+          try { act = heatNextStep(e, C); } catch (eN) { act = null; }
+          if (!act || !act.label) return;
+          var ns = document.createElement('span');
+          ns.className = 'ns';
+          ns.textContent = '→ ' + act.label;
+          ns.title = 'Next step from the WO Assist playbook, ranked from this row’s status, priority, clock and dates only'
+            + (act.why ? ' - ' + act.why : '')
+            + '. A board row carries no POs, trips, notes or documents, so PO / no-show / docs / note steps cannot be judged here.';
+          row.appendChild(ns);
         }
 
         // Snooze/unsnooze on any listed WO (v3.8): acts on the kind-based ack store.
@@ -6670,7 +7102,10 @@
         function loadRatio(e) {
           var h2 = parseFloat(String(e.hrs || '').replace(/,/g, ''));
           if (isNaN(h2)) return 0;
-          var th2 = thresholdsFor(e.status, e.prio, Cn);
+          // Rank against the SAME limit the row was JUDGED by, SLA included. Without the
+          // 4th arg an API row would be ranked on the label-parsed limit while its red/amber
+          // came from the SLA one, so the ordering would disagree with the reasons beside it.
+          var th2 = thresholdsFor(e.status, e.prio, Cn, e.sla);
           return th2.bad > 0 ? h2 / th2.bad : 0;
         }
         entries.filter(function (e) { return e.sev > 0; })
@@ -6684,6 +7119,7 @@
             cl.textContent = e.client + (lr >= 1 ? ' \u00b7 ' + lr.toFixed(1) + '\u00d7 limit' : '');
             var rs = document.createElement('span'); rs.className = 'rs'; rs.textContent = e.reasons.join(' \u00b7 '); rs.title = e.reasons.join(' \u00b7 ');
             row.appendChild(a); row.appendChild(cl); row.appendChild(rs);
+            addNextStep(row, e, Cn);
             addSnooze(row, e);
             off.appendChild(row);
           });
@@ -6698,12 +7134,20 @@
       copyBtn.type = 'button'; copyBtn.className = 'primary'; copyBtn.textContent = 'Copy Audit TSV';
       copyBtn.addEventListener('click', function () {
         if (!entries.length) { copyBtn.textContent = 'Run Scan All first'; setTimeout(function () { copyBtn.textContent = 'Copy Audit TSV'; }, 1800); return; }
-        var COLS = ['WO', 'Client', 'Status', 'Priority', 'Assigned To', 'Hrs In Status', '# Days', 'DNE', 'Scheduled', 'Last Note', 'Complete By', 'Heat', 'Reasons'];
+        // New trailing columns only - anything already pasting this into a sheet keeps its
+        // existing column positions, and the four API-only fields are simply blank on a
+        // DOM scan rather than shifting everything right.
+        var COLS = ['WO', 'Client', 'Status', 'Priority', 'Assigned To', 'Hrs In Status', '# Days', 'DNE', 'Scheduled', 'Last Note', 'Complete By', 'Heat', 'Reasons',
+          'Phase', 'Vendor NTE', 'Vendors', 'Next Step'];
+        var Ct = bwnConfig();
         var lines = [COLS.join('\t')];
         entries.slice().sort(function (a, b) { return b.sev - a.sev || (parseFloat(b.hrs.replace(/,/g, '')) || 0) - (parseFloat(a.hrs.replace(/,/g, '')) || 0); })
           .forEach(function (e) {
+            var act = null;
+            try { act = heatNextStep(e, Ct); } catch (eT) { act = null; }
             lines.push([e.wo, e.client, e.status, e.prio, e.assignee, e.hrs, e.days, e.dne, e.sched, e.lastNote, e.exp,
-              e.sev === 2 ? 'RED' : e.sev === 1 ? 'AMBER' : '', e.reasons.join(' | ')]
+              e.sev === 2 ? 'RED' : e.sev === 1 ? 'AMBER' : '', e.reasons.join(' | '),
+              e.phase, e.nte, e.vendors, act && act.label]
               .map(function (v) { return String(v || '').replace(/[\t\n]/g, ' '); }).join('\t'));
           });
         navigator.clipboard.writeText(lines.join('\n')).then(function () {
@@ -6892,17 +7336,17 @@
           // Compute the verdict now so heatStore carries sev/reasons/kinds like the DOM path.
           var C = bwnConfig();
           var e = mapped.entry;
-          var vf = computeVerdict({
-            status: e.status, prio: e.prio,
-            ageDays: parseFloat(String(e.days || '').replace(/,/g, '')),
-            hrs: parseFloat(String(e.hrs || '').replace(/,/g, '')),
-            expTs: BWN.parseUSDate(e.exp), schedTs: BWN.parseUSDate(e.sched), lastNoteTs: BWN.parseUSDate(e.lastNote)
-          }, C);
+          var vf = heatVerdictFor(e, C);
           var acked = vf.sev > 0 ? ackGet(e.id, vf.kinds) : false;
           heatStore[mapped.href] = {
             id: e.id, kinds: vf.kinds.slice(), acked: acked, sev: vf.sev, reasons: vf.reasons.slice(),
             wo: e.wo, tracking: e.tracking, status: e.status, prio: e.prio, client: e.client,
-            assignee: e.assignee, hrs: e.hrs, days: e.days, dne: e.dne, sched: e.sched, lastNote: e.lastNote, exp: e.exp
+            assignee: e.assignee, hrs: e.hrs, days: e.days, dne: e.dne, sched: e.sched, lastNote: e.lastNote, exp: e.exp,
+            // API-only facts. The DOM scan leaves these undefined and every consumer
+            // treats undefined as "not read" rather than as a zero.
+            assigneeId: e.assigneeId, nte: e.nte, dneAmt: e.dneAmt, nteAmt: e.nteAmt,
+            phase: e.phase, vendors: e.vendors, vendorsKnown: e.vendorsKnown,
+            remDays: e.remDays, sla: e.sla, slaScaled: vf.slaScaled, src: 'api'
           };
         }
       }
@@ -6921,6 +7365,20 @@
         woListHeat();
         if (clean) heatSnapshot();
         var pn = document.getElementById(PANEL_ID); if (pn) { pn.remove(); toggleAuditPanel(); }
+        // Names, and with them the inactive-user signal, land a beat later: the scan itself
+        // must not block on a second round trip, so the strip and panel render immediately
+        // off the ids and then re-render once. Deliberately AFTER the snapshot above - the
+        // snapshot counts sev, and re-judging can only ever ADD an orphan amber, so a name
+        // arriving late must not retro-edit the day's recorded numbers. The re-render is
+        // skipped entirely when nothing changed.
+        if (clean && heatStore) {
+          var store = heatStore;
+          heatResolveAssignees(store).then(function (changed) {
+            if (!changed || heatStore !== store) return;   // navigated away, or nothing to fill
+            woListHeat();
+            var pn2 = document.getElementById(PANEL_ID); if (pn2) { pn2.remove(); toggleAuditPanel(); }
+          }, function () { /* resolution is best-effort; the ids never reach the panel either way */ });
+        }
       }
 
       // A route change mid-scan nulls heatStore under us; absorbing into it would throw
