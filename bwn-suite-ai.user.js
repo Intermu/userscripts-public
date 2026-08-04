@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - AI (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.42.4
+// @version      1.42.5
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-ai.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-ai.user.js
 // @description  The Umbrava tools that call outside APIs, kept separate from the zero-egress Core script. Client Update and WO Audit drafts (Anthropic Claude; draft-only, scrubbed before sending, you review before posting); Find Techs / Find Suppliers (Google Places; vendor leads near a WO); and Job View (opens the Ops-Dashboard job card on the WO page - WO details from Umbrava plus the authored case file and next actions, read-only). Network access is limited by the browser to the declared API hosts and the BWN Static Web App. API keys are stored in Tampermonkey's storage via the menu commands and never enter the page. Toggle modules in BWN_MODULES below.
@@ -3151,7 +3151,7 @@
   });
 
 // ==========================================================================
-// MODULE: Job View v0.1
+// MODULE: Job View v0.2
 // Ports the SWA Ops-Dashboard job modal onto an Umbrava WO page. A coordinator
 // pops the same rich case-file card (read-only). GraphQL (same-origin, Auth0
 // bearer) feeds the live WO fields; the SWA connector feeds the authored notes,
@@ -4718,9 +4718,14 @@ if (BWN_MODULES.jobView) BWN.safeModule('jobView', function () {
     }
   }
 
+  // `data-bwn-float` is the marker mount() reads to tell a fallback button from an anchored one.
+  // bottom is 78px, NOT 20px: Umbrava's Zendesk help-widget launcher iframe occupies bottom
+  // 15px..71px of the right edge (measured on a live WO page 2026-08-04), so the old fallback sat
+  // fully behind it and read as a missing button. 78px clears its top edge by 7px.
   function styleLaunchBtn(btn, floating) {
     btn.style.cssText = 'display:inline-flex;align-items:center;gap:6px;font:500 12px -apple-system,BlinkMacSystemFont,\'Segoe UI\',Arial,sans-serif;padding:6px 12px;border-radius:7px;border:1px solid #1a5f3e;background:#1a5f3e;color:#fff;cursor:pointer;vertical-align:middle;'
-      + (floating ? 'position:fixed;bottom:20px;right:20px;z-index:99999;box-shadow:0 4px 14px rgba(0,0,0,.25);' : 'margin-left:8px;');
+      + (floating ? 'position:fixed;bottom:78px;right:20px;z-index:99999;box-shadow:0 4px 14px rgba(0,0,0,.25);' : 'margin-left:8px;');
+    if (floating) btn.dataset.bwnFloat = '1'; else delete btn.dataset.bwnFloat;
   }
   function makeLaunchBtn() {
     var btn = document.createElement('button');
@@ -4734,9 +4739,26 @@ if (BWN_MODULES.jobView) BWN.safeModule('jobView', function () {
     document.body.appendChild(btn);
   }
   function mount() {
-    if (document.getElementById(BTN_ID)) { BWN.beat('jobView', 'ok', 'launcher mounted'); return true; }
-    if (!/\/work-orders\//.test(location.pathname)) return false;
+    var ex = document.getElementById(BTN_ID);
+    if (!/\/work-orders\/\d+/.test(location.pathname)) {
+      // A floating fallback lives on document.body, so no SPA route change ever unmounts it - it
+      // rode along onto the WO LIST and parked bottom-right there (observed 2026-08-04). An
+      // anchored button is React's child and is already gone, hence the float-only remove.
+      if (ex && ex.dataset.bwnFloat === '1') ex.remove();
+      return false;
+    }
     var anchor = document.querySelector('[data-testid="work-order-header-tracking-number"]');
+    if (ex) {
+      if (ex.dataset.bwnFloat !== '1') { BWN.beat('jobView', 'ok', 'launcher mounted'); return true; }
+      // UPGRADE. The old code returned true for ANY existing button, so one slow load that hit the
+      // ~10s floating fallback left the button parked bottom-right for the rest of the SPA session
+      // even after the header rendered - the anchored mount could never win the race twice.
+      if (!anchor || !anchor.parentNode) return false;
+      styleLaunchBtn(ex, false);
+      anchor.parentNode.insertBefore(ex, anchor.nextSibling);
+      BWN.beat('jobView', 'ok', 'floating fallback re-anchored to the WO header');
+      return true;
+    }
     if (!anchor || !anchor.parentNode) { BWN.beat('jobView', 'waiting', 'WO header tracking anchor not found'); return false; }
     var btn = makeLaunchBtn(); styleLaunchBtn(btn, false);
     anchor.parentNode.insertBefore(btn, anchor.nextSibling);

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.24
+// @version      1.66.25
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -44,7 +44,7 @@
   try { localStorage.setItem('bwn:status:core', JSON.stringify({ ver: BWN_VER, ts: Date.now() })); } catch (e) { /* best-effort */ }
 
   console.info('[BWN SUITE CORE] v' + BWN_VER + ' |',
-    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.66 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.17 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.3 \u00b7 Connector 1.2 |',
+    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.66 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.17 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.4 \u00b7 Connector 1.2 |',
     'enabled:', Object.keys(BWN_MODULES).filter(function (k) { return BWN_MODULES[k]; }).join(', '));
 
   // ===== BWN SHARED CORE v7 - KEEP IN SYNC across both suite scripts =====
@@ -9582,9 +9582,11 @@
 
 
   // ==========================================================================
-  // MODULE: Trip Calendar v1.3 - export a WO's scheduled trips to .ics
+  // MODULE: Trip Calendar v1.4 - export a WO's scheduled trips to .ics
   // ==========================================================================
-  // On the WO Trips tab, a floating button downloads the UPCOMING (non-completed,
+  // On the WO Trips tab, a button anchored into Umbrava's own "Schedule Trip"
+  // split-button group (v1.4; it used to float bottom-right, underneath the help
+  // bubble) downloads the UPCOMING (non-completed,
   // non-cancelled) trips as an .ics file - one VEVENT per trip - so coordinators
   // can drop them straight onto Outlook. Pure client-side Blob download (zero
   // egress). Also caches the latest scheduled trip date to the bus (bwn:trips:{id})
@@ -9692,10 +9694,48 @@
       if (document.getElementById('bwn-tc-style')) return;
       var st = document.createElement('style'); st.id = 'bwn-tc-style';
       st.textContent =
-        '#bwn-tripcal-btn{position:fixed;right:18px;bottom:18px;z-index:99997;border:none;border-radius:11px;padding:10px 15px;background:' + BWN.GREEN + ';color:#fff;font:500 12.5px -apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;cursor:pointer;box-shadow:0 8px 26px rgba(0,0,0,.3);}' +
+        // Inline (anchored) is the DEFAULT shape: a 32px pill sized to sit inside Umbrava's
+        // split-button group, so it reads as one row with "Schedule Trip".
+        // `position:static` is declared, not left to default: a stale cached copy of the pre-1.4
+        // stylesheet (which set position:fixed on this same id) would otherwise still win, and the
+        // button would sit bottom-right while LOOKING correctly anchored in the DOM tree.
+        // `gap` replaces the label span's trailing space: as flex items the two spans collapse
+        // it, and the count read as "calendar(2)".
+        '#bwn-tripcal-btn{position:static;display:inline-flex;align-items:center;gap:5px;height:32px;padding:0 12px;margin-right:8px;border:none;border-radius:6px;background:' + BWN.GREEN + ';color:#fff;font:500 12.5px -apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;cursor:pointer;white-space:nowrap;vertical-align:middle;}' +
+        // Fallback shape only. bottom is 78px, NOT 18px: Umbrava's Zendesk help-widget launcher
+        // iframe occupies bottom 15px..71px of the right edge (measured 2026-08-04), so the old
+        // pill sat fully behind it and read as a missing button. 78px clears its top edge by 7px.
+        '#bwn-tripcal-btn[data-bwn-float="1"]{position:fixed;right:18px;bottom:78px;z-index:99997;height:auto;margin-right:0;border-radius:11px;padding:10px 15px;box-shadow:0 8px 26px rgba(0,0,0,.3);}' +
         '#bwn-tripcal-btn:disabled{opacity:.55;cursor:default;}' +
         '#bwn-tripcal-btn .bwn-tc-n{font-family:ui-monospace,"Segoe UI Mono","SF Mono",monospace;}';
       document.head.appendChild(st);
+    }
+
+    // The Trips tab's split-button group ("Schedule Trip") - the SAME MuiButtonGroup the AI
+    // script's AI Draft bar injects into on the Notes tab, which is why anchoring here puts the
+    // export button immediately left of it. Measured live on /work-orders/380320/trips
+    // (2026-08-04): wrapper > div > .MuiButtonGroup-root > [trips-split-left|right-button], and
+    // the AI Draft bar survives the tab switch as that group's first child.
+    function tripsAnchor() { return document.querySelector('[data-testid="trips-split-left-button"]'); }
+
+    // Anchor if we can, float if we cannot, and UPGRADE a floating button the moment the anchor
+    // shows up. Every DOM write here is guarded by a position check - an unconditional
+    // insertBefore is a mutation that re-fires our own observer forever.
+    function placeBtn(btn) {
+      var a = tripsAnchor();
+      if (a && a.parentNode) {
+        if (btn.parentNode !== a.parentNode || btn.nextSibling !== a) a.parentNode.insertBefore(btn, a);
+        if (btn.dataset.bwnFloat === '1') {
+          delete btn.dataset.bwnFloat;
+          BWN.beat('tripCal', 'ok', 'floating fallback re-anchored to the Trips split-button group');
+        }
+        return;
+      }
+      if (btn.dataset.bwnFloat !== '1') {
+        btn.dataset.bwnFloat = '1';
+        document.body.appendChild(btn);
+        BWN.beat('tripCal', 'miss', 'Trips split-button anchor absent - floating fallback');
+      } else if (btn.parentNode !== document.body) document.body.appendChild(btn);
     }
 
     function ensureBtn() {
@@ -9719,9 +9759,9 @@
           var meta = woMeta();
           download(buildICS(t2, meta), 'WO-' + (meta.tracking || currentWOId() || 'trips') + '-trips.ics');
         });
-        document.body.appendChild(btn);
+        placeBtn(btn);
         BWN.beat('tripCal', 'ok', 'export button mounted');
-      }
+      } else placeBtn(btn);   // React re-renders the split group on a tab switch, and a fallback must upgrade
       // Write only on CHANGE - a blind textContent write is a DOM mutation that
       // re-fires our own observer, an endless 500ms parse/write tick (review).
       var nTxt = '(' + exp.length + ')', nEl = btn.querySelector('.bwn-tc-n');
