@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.31
+// @version      1.66.32
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -44,7 +44,7 @@
   try { localStorage.setItem('bwn:status:core', JSON.stringify({ ver: BWN_VER, ts: Date.now() })); } catch (e) { /* best-effort */ }
 
   console.info('[BWN SUITE CORE] v' + BWN_VER + ' |',
-    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.66 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.24 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.4 \u00b7 Connector 1.2 |',
+    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.67 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.24 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.4 \u00b7 Connector 1.2 |',
     'enabled:', Object.keys(BWN_MODULES).filter(function (k) { return BWN_MODULES[k]; }).join(', '));
 
   // ===== BWN SHARED CORE v7 - KEEP IN SYNC across both suite scripts =====
@@ -1397,7 +1397,7 @@
   });
 
   // ==========================================================================
-  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.66 (Connector 1.2)
+  // MODULE: WO Assist: GP + ETA Watchdog + Playbook v2.67 (Connector 1.2)
   // ==========================================================================
   bwnBoot('woAssist', BWN_MODULES.woAssist, function () {
     'use strict';
@@ -1427,7 +1427,7 @@
     var PANEL_ID = 'bwn-gp-panel';
     var GREEN = BWN.GREEN;
 
-    console.info('[BWN GP] WO Assist v2.66 loaded on', location.href);
+    console.info('[BWN GP] WO Assist v2.67 loaded on', location.href);
 
     // ---- Parsing helpers (shared via BWN core) -----------------------------
     var parseMoney = BWN.parseMoney;
@@ -1704,6 +1704,69 @@
       if (b) { lastNotesSrc = 'cache'; return b; }
       lastNotesSrc = 'view';
       return readMountedNotes();
+    }
+
+    // ---- Note history WITHOUT waiting for a Deep Scan (2026-08-05) --------------
+    // getNotes()'s last resort is readMountedNotes(), and the notes list is VIRTUALIZED
+    // AND lives on its own tab. On the WO details route - the only route where the
+    // Complete-By picker exists, so the only route the ECD helper ever runs on - that
+    // fallback returns ZERO notes. Every engine read phrased as "what do the notes say"
+    // was therefore judging the WO on nothing at all unless the coordinator had opened
+    // the Notes tab and run a Deep Scan first. The ECD proposal is the sharpest case: it
+    // asks the notes for the promised date, found none, and defaulted to "the 2nd
+    // upcoming Friday" on a WO whose notes carried a real ETA.
+    // Deep Scan has read the whole history in ONE call since 2026-08-04 (bwnNotesApi:
+    // 308 notes on W-283834 where the DOM had 17 mounted). This makes that read happen on
+    // its own, once per WO, and publishes it to the SAME bus, so getNotes() hands the full
+    // history to every consumer - ECD, staleness, the ETA watchdog, action convergence -
+    // without any of them changing how they ask.
+    // Failure is a no-op by design: the caches are left untouched and getNotes() degrades
+    // to exactly what it did before. A partial history is never published.
+    var NOTES_RETRY = 2 * 60000;            // a failed read re-arms sooner than a good one
+    var NOTES_FETCH = Object.create(null);  // woNum -> { s: 'pending'|'ok'|'error', ts }
+    var NOTES_WAIT = Object.create(null);   // woNum -> [cb] fired once, on settle either way
+    function notesReadState(woNum) {
+      var r = woNum && NOTES_FETCH[woNum];
+      if (!r) return null;
+      if (r.s === 'pending') return 'pending';
+      if (Date.now() - r.ts > (r.s === 'error' ? NOTES_RETRY : NOTES_TTL)) return null;   // aged out - re-armable
+      return r.s;
+    }
+    function notesSettle(woNum) {
+      var cbs = NOTES_WAIT[woNum]; delete NOTES_WAIT[woNum];
+      (cbs || []).forEach(function (cb) { try { cb(); } catch (e) { } });
+    }
+    // Fire cb once the read for this WO has settled (or immediately, if it already has).
+    function notesOnRead(woNum, cb) {
+      if (notesReadState(woNum) !== 'pending') { cb(); return; }
+      (NOTES_WAIT[woNum] = NOTES_WAIT[woNum] || []).push(cb);
+    }
+    function fetchNotesApi(woNum) {
+      if (!woNum) return;
+      var s = notesReadState(woNum);
+      if (s === 'pending' || s === 'error') return;   // in flight, or a fresh failure still cooling off
+      // 'ok' only counts while the history is still IN HAND. An SPA nav clears deepNotes and
+      // busNotesPut keeps at most 3 WOs, so a success flag can outlive the notes it stands
+      // for - which would strand the WO on the mounted slice behind an 'ok'.
+      if (s === 'ok' && (deepNotes || busNotesGet())) return;
+      NOTES_FETCH[woNum] = { s: 'pending', ts: Date.now() };
+      bwnNotesApi(woNum).then(function (list) {
+        // Navigated away mid-read: drop the result rather than hang another WO's history
+        // off this one, and clear the slot so revisiting refetches instead of sitting on
+        // an 'ok' that never cached anything.
+        if (currentWOId() !== woNum) { delete NOTES_FETCH[woNum]; notesSettle(woNum); return; }
+        NOTES_FETCH[woNum] = { s: 'ok', ts: Date.now() };
+        deepNotes = list; deepNotesTs = Date.now(); deepNotesViaApi = true;
+        busNotesPut(list);
+        console.info('[BWN GP] note history read from the API:', list.length, 'notes - no Deep Scan needed (published to the suite cache)');
+        notesSettle(woNum);
+        try { refresh(); } catch (e) { }
+      }, function (err) {
+        NOTES_FETCH[woNum] = { s: 'error', ts: Date.now() };
+        console.info('[BWN GP] auto note read unavailable (' + ((err && err.message) || err) + ') - the engine falls back to the notes on screen');
+        notesSettle(woNum);
+        try { refresh(); } catch (e) { }
+      });
     }
 
     function notesScroller() { return BWN.findScroller(document.querySelector(BWN.NOTE_SUMMARY_SEL)); }
@@ -4239,17 +4302,31 @@
     function ecdFmtUS(dt) { var p = function (n) { return (n < 10 ? '0' : '') + n; }; return p(dt.getMonth() + 1) + '/' + p(dt.getDate()) + '/' + dt.getFullYear(); }   // MM/DD/YYYY - mask-safe for the picker
     function ecdFmtISO(dt) { var p = function (n) { return (n < 10 ? '0' : '') + n; }; return dt.getFullYear() + '-' + p(dt.getMonth() + 1) + '-' + p(dt.getDate()); }
     function ecdFieldInput() { var el = document.querySelector('[data-testid="' + ECD_FIELD + '"]'); if (!el) return null; return el.tagName === 'INPUT' ? el : el.querySelector('input'); }
+    // CFG.ETA_WORDS is the watchdog's vocabulary and it is about a vendor ARRIVING. A
+    // completion promise is written in different words - "ECD 8/20", "complete by 8/20",
+    // "done by Friday" - and those notes are precisely what a coordinator means when they
+    // say the date is in the notes. Superset, used ONLY by the ECD proposer, so the
+    // watchdog's own judgement is untouched. Deliberately NOT bare "complete"/"completed":
+    // "work completed 7/15" is a past-tense record, not a promise.
+    var ECD_NOTE_WORDS = /\becd\b|\bcomplet(?:e|ed|ion)\s+(?:by|date)\b|\bfinish(?:ed)?\s+by\b|\bdone\s+by\b/i;
     function latestNotedEta(state) {
       var notes = getNotes(), today = ecdToday(), best = null;
       for (var i = 0; i < notes.length; i++) {
         var b = notes[i].body || '';
-        if (!(CFG.ETA_WORDS.test(b) && CFG.DATE_RE.test(b))) continue;
+        if (!((CFG.ETA_WORDS.test(b) || ECD_NOTE_WORDS.test(b)) && CFG.DATE_RE.test(b))) continue;
         // parseBodyDate (NOT the note-timestamp parser): scans ALL dates in the body,
         // takes the latest, and resolves a yearless "7/15" FORWARD relative to the
         // note - an ETA is a future promise, so bare M/D must look forward, not back.
-        var dm = parseBodyDate(b, parseNoteDate(notes[i].ts));
+        // API notes carry an exact epoch (tsAbs); scraped ones only a rendered string.
+        var when = (notes[i].tsAbs != null) ? notes[i].tsAbs : parseNoteDate(notes[i].ts);
+        var dm = parseBodyDate(b, when);
         if (dm === null || dm < today) continue;   // forward-looking ETAs only - a blown promise isn't a completion date
-        if (!best || dm > best.date) best = { date: dm, ts: notes[i].ts };
+        // The note written LAST is the promise that stands. Ranking by furthest-future
+        // date instead was harmless while this only ever saw the handful of notes the
+        // virtualized list had mounted; against a 300-note history it lets one stale
+        // over-promise from months ago outrank today's revision.
+        var w = (when != null) ? when : 0;
+        if (!best || w > best.when || (w === best.when && dm > best.date)) best = { date: dm, ts: notes[i].ts, when: w };
       }
       return best;
     }
@@ -4261,15 +4338,20 @@
         if (d && d >= today && (!poCand || d > poCand.d)) poCand = { d: d, raw: p.schedDate, vendor: p.vendor };
       });
       var eta = latestNotedEta(state);
+      // What the note read actually saw, so the dialog can SAY it instead of the
+      // coordinator having to trust that "no noted ETA" means the notes were read.
+      var notes = getNotes();
+      var srcLabel = { api: 'full note history, read from the API', deep: 'full note history, from a Deep Scan', cache: 'full note history, from the suite cache', view: 'ONLY the notes rendered on screen - the API read did not land' }[lastNotesSrc] || lastNotesSrc;
+      var meta = { noteCount: notes.length, noteSrc: lastNotesSrc, noteSrcLabel: srcLabel };
       // Scheduled trip signal (cached to the bus by tripCal when the Trips tab was viewed).
       var trip = null;
       try { var tb = BWN.ssGetJSON('bwn:trips:' + currentWOId(), null); if (tb && tb.latestScheduled && tb.latestScheduled >= today) trip = tb.latestScheduled; } catch (e) { }
       var cands = [];
       if (trip) cands.push({ ms: trip, why: 'latest scheduled trip (from the Trips tab)' });
       if (poCand) cands.push({ ms: poCand.d, why: 'PO scheduled ' + poCand.raw + ' (' + poCand.vendor + ')' });
-      if (eta) cands.push({ ms: eta.date, why: 'ETA noted in a WO note' + (eta.ts ? ' (' + eta.ts + ')' : '') });
-      if (cands.length) { cands.sort(function (a, b) { return b.ms - a.ms; }); return { date: new Date(cands[0].ms), from: 'signal', why: cands[0].why }; }   // latest of trip/PO/ETA = complete-by ≥ last scheduled work
-      return { date: ecdSecondFriday(), from: 'default', why: 'no scheduled trip, PO date, or noted ETA - defaulted to the 2nd upcoming Friday' };
+      if (eta) cands.push({ ms: eta.date, why: 'the completion date in the latest note that gives one' + (eta.ts ? ' (' + eta.ts + ')' : '') });
+      if (cands.length) { cands.sort(function (a, b) { return b.ms - a.ms; }); return { date: new Date(cands[0].ms), from: 'signal', why: cands[0].why, noteCount: meta.noteCount, noteSrc: meta.noteSrc, noteSrcLabel: meta.noteSrcLabel }; }   // latest of trip/PO/ETA = complete-by ≥ last scheduled work
+      return { date: ecdSecondFriday(), from: 'default', why: 'no scheduled trip, PO date, or noted completion date - defaulted to the 2nd upcoming Friday', noteCount: meta.noteCount, noteSrc: meta.noteSrc, noteSrcLabel: meta.noteSrcLabel };
     }
     // True when the WO already carries the ETA info the helper would ask for - used
     // to SUPPRESS the auto-pop (don't nag when a PO date or a noted ETA is on file).
@@ -4364,6 +4446,7 @@
 
     function ecdHelperOpen(state) {
       if (!onWO() || !currentWOId()) { alert('Open a work order to set its expected completion date.'); return; }
+      fetchNotesApi(currentWOId());   // no-op if the engine already warmed it; arms the re-propose below otherwise
       ensureEcdStyle();
       var old = document.getElementById('bwn-ecd-overlay'); if (old) old.remove();
       var prop = proposeECD(state);
@@ -4380,6 +4463,12 @@
       var cur = document.createElement('div'); cur.className = 'bwn-ecd-cur';
       cur.textContent = (curRaw && curRaw.trim()) ? ('Current ECD: ' + curRaw.trim() + (state.due && state.due.kind === 'bad' ? ' - overdue' : '')) : 'No expected completion date set.';
       body.appendChild(cur);
+      // Say what the proposal was computed FROM. "No noted completion date" is only
+      // worth anything if the coordinator can see that the notes were actually read -
+      // before this fix the line would have said "0 notes" on every details-tab popup.
+      var srcLine = document.createElement('div'); srcLine.className = 'bwn-ecd-cur';
+      function paintSrc(p) { srcLine.textContent = p.noteCount + ' note' + (p.noteCount === 1 ? '' : 's') + ' read - ' + p.noteSrcLabel + '.'; }
+      paintSrc(prop); body.appendChild(srcLine);
       var pr = document.createElement('div'); pr.className = 'bwn-ecd-basis'; pr.textContent = 'Proposed from: ' + prop.why; body.appendChild(pr);
       var dl = document.createElement('label'); dl.className = 'bwn-ecd-lbl'; dl.textContent = 'New expected completion date (time set to 11:59 PM)'; body.appendChild(dl);
       var di = document.createElement('input'); di.type = 'date'; di.className = 'bwn-ecd-date'; di.value = ecdFmtISO(prop.date); body.appendChild(di);
@@ -4387,6 +4476,25 @@
       var ri = document.createElement('textarea'); ri.className = 'bwn-ecd-reason'; ri.rows = 2;
       ri.placeholder = prop.from === 'default' ? 'e.g. awaiting vendor scheduling - targeting end of next week' : 'e.g. vendor scheduled; completion expected by this date';
       body.appendChild(ri);
+
+      // Opened by hand (the "Set ECD…" button / core:ecd) while the note read is still in
+      // flight: the proposal above came from whatever was mounted. Re-propose when the full
+      // history lands - but NEVER over an edit the coordinator has already made, and never
+      // into a dialog they have since closed. The auto-pop can't reach this path; it waits
+      // for the read instead (maybeAutoECD).
+      var ecdWoNum = currentWOId();
+      if (notesReadState(ecdWoNum) === 'pending') {
+        var touched = false;
+        di.addEventListener('input', function () { touched = true; });
+        ri.addEventListener('input', function () { touched = true; });
+        notesOnRead(ecdWoNum, function () {
+          if (touched || document.getElementById('bwn-ecd-overlay') !== ov || currentWOId() !== ecdWoNum) return;
+          var p2 = proposeECD(state);
+          di.value = ecdFmtISO(p2.date);
+          pr.textContent = 'Proposed from: ' + p2.why;
+          paintSrc(p2);
+        });
+      }
       card.appendChild(body);
 
       var ft = document.createElement('div'); ft.className = 'bwn-ecd-ft';
@@ -4458,6 +4566,14 @@
       // ECD overlay would sit on top and block it. Do NOT burn the once-per-WO guard - the
       // refresh loop re-checks, so the popup opens once the modal closes.
       if (umbravaModalOpen()) return;
+      // Wait for the note read. Both questions this popup answers - "is a completion date
+      // already promised somewhere?" (the suppressor above) and "what date should we
+      // propose?" - are answered FROM the notes, and on this route there are none mounted
+      // to read. Popping first would nag past a real ETA, propose the default Friday, and
+      // burn the once-per-WO guard doing it. The guard is NOT burned here: the read calls
+      // refresh() when it settles, and this re-runs with the real history. An errored read
+      // falls through and behaves exactly as it did before.
+      if (notesReadState(woId) === 'pending') return;
       ecdAutoShownFor = woId;
       ecdHelperOpen(state);
     }
@@ -4915,6 +5031,11 @@
         BWN.beat('woAssist', 'waiting', 'WO anchors not rendered');
         return;
       }
+      // Warm the full note history before the engine reads it. First pass on a WO runs on
+      // whatever is mounted (usually nothing on the details route); the read calls refresh()
+      // again when it lands, and every notes-derived judgement recomputes off the real
+      // history. Same once-per-WO shape as fetchWO / fetchTrips above.
+      fetchNotesApi(woIdent);
       var st = compute();
       // Keep the acts store honest whether or not the dock renders: auto-detect actioned
       // steps from posted notes (idempotent - renderActsInline re-runs it when the dock shows).
