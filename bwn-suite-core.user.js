@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.30
+// @version      1.66.31
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -44,7 +44,7 @@
   try { localStorage.setItem('bwn:status:core', JSON.stringify({ ver: BWN_VER, ts: Date.now() })); } catch (e) { /* best-effort */ }
 
   console.info('[BWN SUITE CORE] v' + BWN_VER + ' |',
-    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.66 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.21 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.4 \u00b7 Connector 1.2 |',
+    'Shared Core 7 \u00b7 PO Approval 1.13 \u00b7 WO Assist 2.66 \u00b7 Leak Guard 2.0 \u00b7 List Heat 3.24 \u00b7 Launcher 2.0 \u00b7 Views 1.0 \u00b7 Palette 1.1 \u00b7 Visit 1.2 \u00b7 Reminders 1.1 \u00b7 Timeline 1.1 \u00b7 TripCal 1.4 \u00b7 Connector 1.2 |',
     'enabled:', Object.keys(BWN_MODULES).filter(function (k) { return BWN_MODULES[k]; }).join(', '));
 
   // ===== BWN SHARED CORE v7 - KEEP IN SYNC across both suite scripts =====
@@ -5665,7 +5665,7 @@
     }
     window.__bwnWoHeat = true;
 
-    console.info('[BWN HEAT] v3.23 loaded on', location.href);
+    console.info('[BWN HEAT] v3.24 loaded on', location.href);
 
     // ---- Config (edit here) ----------------------------------------------
     // Advanced knobs (status-class regexes + priority multipliers) now live in the
@@ -6535,10 +6535,15 @@
     //   { status, prio, ageDays (number|NaN), hrs (number|NaN),
     //     expTs, schedTs, lastNoteTs (epoch ms | null) }
     // Returns { sev 0|1|2, reasons[], kinds[], over30, limitBad, limitWatch, stale,
-    //           noteAge (days | null) }. A done/closed status is always sev 0.
+    //           noteAge (days | null), warn, bad }. A done/closed status is always sev 0.
+    // `warn`/`bad` are the hours limits this row was actually judged against, returned so a
+    // consumer can SHOW the limit without owning a second copy of the threshold model -
+    // bwnThresholdsFor is deliberately file-local to this script (see its header), so any
+    // limit computed elsewhere would be a copy that drifts. They stay null on a done row,
+    // which has no clock at all: absent, not zero.
     function computeVerdict(f, C) {
       var reasons = [], kinds = [], sev = 0;
-      var v = { sev: 0, reasons: reasons, kinds: kinds, over30: false, limitBad: false, limitWatch: false, stale: false, noteAge: null, slaScaled: false };
+      var v = { sev: 0, reasons: reasons, kinds: kinds, over30: false, limitBad: false, limitWatch: false, stale: false, noteAge: null, slaScaled: false, warn: null, bad: null };
       function bump(level, msg, kind) {
         if (level > sev) sev = level;
         reasons.push(msg);
@@ -6552,6 +6557,7 @@
       v.over30 = !isNaN(f.ageDays) && f.ageDays > 30;
       var th = thresholdsFor(f.status, f.prio, C, f.sla);
       v.slaScaled = !!th.sla;
+      v.warn = th.warn; v.bad = th.bad;
       if (!isNaN(f.hrs)) {
         if (f.hrs >= th.bad) { bump(2, Math.round(f.hrs) + 'h in "' + (f.status || '?') + '" (limit ' + Math.round(th.bad) + 'h)', 'limitbad'); v.limitBad = true; }
         else if (f.hrs >= th.warn) { bump(1, Math.round(f.hrs) + 'h in "' + (f.status || '?') + '" (watch from ' + Math.round(th.warn) + 'h)', 'limitwatch'); v.limitWatch = true; }
@@ -6624,6 +6630,44 @@
         dneAmt: e.dneAmt, nteAmt: e.nteAmt,
         assignee: e.assignee, assigneeInactive: e.assigneeInactive
       }, C || bwnConfig());
+    }
+
+    // Publish EVERY stored row's verdict to the per-WO bus slot (v3.24). `bwn:heat:{id}` is an
+    // existing contract, already read through BWN.busHeatGet for WO Assist's "Flagged on WO
+    // list", so this is that contract at full-board coverage rather than a new one. Measured
+    // 2026-08-05 on a 219-row board: only 22 keys existed, because the ONLY writer was the DOM
+    // tinting pass - which writes just the rows the virtualizer currently renders. Any second
+    // consumer therefore saw heat on a tenth of the board and no severity at all on the rest.
+    // The board view (bwn-kanban) is that consumer, and it must not judge rows itself:
+    // bwnThresholdsFor is deliberately file-local to this script, so a limit computed in
+    // another file would be a copy that drifts (the exact failure computeVerdict exists to
+    // prevent). Fields are additive and `v` stays 1 - busHeatGet rejects any other version.
+    // Same payload shape as the DOM writer, deliberately: two writers on one key must agree.
+    function heatPublishVerdicts(store) {
+      if (!store) return 0;
+      var keys = Object.keys(store), n = 0, ts = Date.now(), err = null;
+      for (var i = 0; i < keys.length; i++) {
+        var r = store[keys[i]];
+        if (!r || !r.id) continue;
+        try {
+          sessionStorage.setItem('bwn:heat:' + r.id, JSON.stringify({
+            v: 1, ts: ts, sev: r.sev || 0,
+            reasons: (r.reasons || []).slice(), acked: !!r.acked,
+            hrs: (r.hrs === '' || r.hrs == null) ? null : parseFloat(r.hrs),
+            warn: (typeof r.warn === 'number') ? r.warn : null,
+            bad: (typeof r.bad === 'number') ? r.bad : null,
+            status: r.status || '', src: 'api'
+          }));
+          n++;
+        } catch (e) {
+          // A full quota must not fail the scan - and must not fail SILENTLY either, or a
+          // consumer reads stale heat for the unwritten rows and cannot tell.
+          err = (e && e.name) || 'write failed';
+          break;
+        }
+      }
+      if (err) console.warn('[BWN HEAT] verdict publish stopped after ' + n + ' of ' + keys.length + ' rows (' + err + ')');
+      return n;
     }
 
     // ---- Assignee names from GUIDs ------------------------------------------------
@@ -6873,10 +6917,11 @@
         // and once thresholdsFor actually honours the 4th arg, a tint that omitted it would
         // judge the row on the label clock while the stored sev beside it came from the
         // client's. Same WO, same store record - undefined on a DOM-only scan, as before.
+        var domHrs = parseFloat(cellText(tr, H.hrs).replace(/,/g, ''));
         var vf = computeVerdict({
           status: status, prio: prio, phase: apiRec ? apiRec.phase : undefined, ageDays: ageDays,
           sla: apiRec ? apiRec.sla : undefined,
-          hrs: parseFloat(cellText(tr, H.hrs).replace(/,/g, '')),
+          hrs: domHrs,
           expTs: parseUSDate(cellText(tr, H.exp)),
           schedTs: parseUSDate(cellText(tr, H.sched)),
           lastNoteTs: parseUSDate(cellText(tr, H.lastNote))
@@ -6928,8 +6973,17 @@
 
         // Phase 2 seam: persist this row's verdict so WO Assist can show
         // "Flagged on WO list" when the user opens the WO. Best-effort.
+        // v3.24: carries the SAME extra fields the API publisher writes (hrs + the limits the
+        // row was judged against). Both writers must emit one shape: this pass runs on every
+        // virtualizer tick, so a leaner DOM payload would silently overwrite the richer
+        // API-published record for exactly the rows currently on screen - the v3.20
+        // two-writers-one-key fault in a different store.
         try {
-          if (rowId) sessionStorage.setItem('bwn:heat:' + rowId, JSON.stringify({ v: 1, ts: Date.now(), sev: sev, reasons: reasons, acked: acked }));
+          if (rowId) sessionStorage.setItem('bwn:heat:' + rowId, JSON.stringify({
+            v: 1, ts: Date.now(), sev: sev, reasons: reasons, acked: acked,
+            hrs: isNaN(domHrs) ? null : domHrs, warn: vf.warn, bad: vf.bad,
+            status: status, src: 'dom'
+          }));
         } catch (eS) { /* best-effort */ }
 
         if (heatStore) {
@@ -7514,7 +7568,10 @@
             // treats undefined as "not read" rather than as a zero.
             assigneeId: e.assigneeId, nte: e.nte, dneAmt: e.dneAmt, nteAmt: e.nteAmt,
             phase: e.phase, vendors: e.vendors, vendorsKnown: e.vendorsKnown,
-            remDays: e.remDays, sla: e.sla, slaScaled: vf.slaScaled, src: 'api'
+            remDays: e.remDays, sla: e.sla, slaScaled: vf.slaScaled, src: 'api',
+            // The limits this row was judged against, so a consumer can print "1.8x the
+            // 120h limit" without a second threshold model (see computeVerdict's header).
+            warn: vf.warn, bad: vf.bad
           };
         }
       }
@@ -7529,6 +7586,16 @@
         // "of 0 open - full board" off a scan that actually failed. No store = the strip
         // falls back to the loaded rows and still says "Scan All for full board".
         if (!clean) heatStore = null;
+        // v3.24: publish EVERY scanned row's verdict to the per-WO bus slot, not just the rows
+        // the virtualizer happened to render. `bwn:heat:{id}` is an existing contract already
+        // read through BWN.busHeatGet (WO Assist's "Flagged on WO list"), so this is the same
+        // contract at full-board coverage rather than a new one. Measured 2026-08-05 on a
+        // 219-row board: 22 keys existed, because the ONLY writer was the DOM tinting pass -
+        // so any second consumer saw heat on a tenth of the board and no severity on the rest.
+        // Additive fields only and `v` stays 1: busHeatGet rejects any other version outright.
+        // Only on a clean finish - a dirty scan drops the store above, and publishing a
+        // partial board as if it were the board is the mistake `heatScanClean` exists to stop.
+        if (clean && heatStore) heatPublishVerdicts(heatStore);
         console.info('[BWN HEAT] API scan ' + (clean ? 'complete' : 'incomplete') + ':', n, 'WOs in', pages, 'page(s)' + (note ? ' | ' + note : '') + (target != null ? ' | list total ' + target : ''));
         woListHeat();
         if (clean) heatSnapshot();
@@ -7543,6 +7610,10 @@
           var store = heatStore;
           heatResolveAssignees(store).then(function (changed) {
             if (!changed || heatStore !== store) return;   // navigated away, or nothing to fill
+            // Re-publish: resolution can only ADD an orphan amber, and a row the virtualizer
+            // is not rendering has no other writer, so without this the bus would hold a
+            // verdict one signal out of date for most of the board.
+            heatPublishVerdicts(store);
             woListHeat();
             var pn2 = document.getElementById(PANEL_ID); if (pn2) { pn2.remove(); toggleAuditPanel(); }
           }, function () { /* resolution is best-effort; the ids never reach the panel either way */ });
