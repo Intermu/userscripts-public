@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Suite - Core (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.66.28
+// @version      1.66.30
 // @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-suite-core.user.js
 // @description  Runs several Umbrava helpers for BWN coordinators, in the browser with no privileged grants. Includes: PO Approval + ETA Builder; WO Assist (GP/ETA, a stall watchdog, DNE calculator, and a next-action playbook); Email Leak Guard (checks recipients against vendor names, PO amounts, and client budget references before an outbound email sends); WO List Heat (a triage overlay + My Day strip on the work-order list, with an optional same-origin Umbrava API scan for deterministic full-board coverage); and the BWN Launcher (opens the Azure Static Web App tools with the current WO's context). Modules share state through sessionStorage/localStorage. The only network calls are same-origin Umbrava GraphQL reads (app.umbrava.com/api/graphql, the app's own session): List Heat's full-board scan and WO Assist's work-order / trip / clock-in reads; everything else is offline. Toggle modules in BWN_MODULES below.
@@ -5654,7 +5654,7 @@
   });
 
   // ==========================================================================
-  // MODULE: WO List Heat v3.21
+  // MODULE: WO List Heat v3.23
   // ==========================================================================
   bwnBoot('listHeat', BWN_MODULES.listHeat, function () {
     'use strict';
@@ -5665,7 +5665,7 @@
     }
     window.__bwnWoHeat = true;
 
-    console.info('[BWN HEAT] v3.21 loaded on', location.href);
+    console.info('[BWN HEAT] v3.23 loaded on', location.href);
 
     // ---- Config (edit here) ----------------------------------------------
     // Advanced knobs (status-class regexes + priority multipliers) now live in the
@@ -6467,7 +6467,7 @@
         var s = { bad: 0, warn: 0, open: 0, over30: 0 };
         Object.keys(heatStore).forEach(function (k) {
           var e = heatStore[k];
-          if (/complete|invoiced|closed|cancel/i.test(e.status || '')) return;
+          if (heatDone(e.status, e.phase)) return;
           s.open++;
           if (e.sev === 2) s.bad++; else if (e.sev === 1) s.warn++;
           var age = parseFloat(String(e.days || '').replace(/,/g, ''));
@@ -6481,9 +6481,53 @@
       } catch (e) { /* best-effort */ }
     }
 
+    // ---- Is this row finished? ONE place (v3.22) ------------------------------------
+    // Every "open" count in this module, and the verdict engine itself, asks this. Two
+    // signals, in a deliberate order of authority:
+    //   1. `phase` - Umbrava's own lifecycle field. A terminal phase means over, full stop.
+    //   2. `phase` again - an explicitly ACTIVE phase VETOES the status-name guess below.
+    //   3. the status NAME - free text, and a guess. Only reachable when no phase was read.
+    //
+    // Step 2 is the fix. Measured on the live board 2026-08-05: 218 rows, every one
+    // phase "Open", and the strip announced "of 199 open". The 19 missing rows all sat in
+    // status "Clocked Out: Complete" - the tech has clocked out saying their visit is done,
+    // the WO is still Open and still owes cost review and close-out. The name regex matched
+    // the word "Complete" and muted all 19 everywhere at once: out of the open denominator,
+    // never tinted, absent from the My Day pills, the audit table, the offender ranking, the
+    // over-30 batch and the daily snapshot. 5 of them were over 30 days old and 10 were past
+    // their complete-by date, so they were the LAST rows that should have been silent.
+    // Core's own action taxonomy already knew better - WO_PHASE maps 'clocked out: complete'
+    // to 'costreview', explicitly NOT terminal - so the two halves of this file disagreed.
+    //
+    // The active list is a WHITELIST, not "anything that is not terminal". WorkComplete /
+    // ConfirmComplete phases keep today's name-based behaviour: un-muting those is a
+    // separate question and nobody has measured it. This change can only ever REMOVE
+    // silence, and only on a row the server itself calls active.
+    var HEAT_DONE_STATUS_RE = /complete|invoiced|closed|cancel/i;
+    var HEAT_TERMINAL_PHASE_RE = /^(closed|cancel|canceled|cancelled|declined|revoked)/i;
+    var HEAT_ACTIVE_PHASE_RE = /^(open|on[\s-]?hold|pending\s?acceptance|confirm\s?reopen)$/i;
+    function heatDone(status, phase) {
+      var ph = String(phase == null ? '' : phase).trim();
+      if (HEAT_TERMINAL_PHASE_RE.test(ph)) return true;    // the server says it is over
+      if (HEAT_ACTIVE_PHASE_RE.test(ph)) return false;     // the server says it is NOT - beats the name
+      return HEAT_DONE_STATUS_RE.test(String(status == null ? '' : status));
+    }
+
     // ---- Threshold model -----------------------------------------------------------
     // Delegates to the file-shared engine (single source of truth with WO Assist).
-    function thresholdsFor(status, prioText, C) { return bwnThresholdsFor(status, prioText, C); }
+    // THE 4th PARAMETER IS LOAD-BEARING (v3.23). This alias declared only three while both
+    // of its call sites already passed four - computeVerdict passes `f.sla`, the offender
+    // ranking passes `e.sla` - so the row's own { responseMinutes, category } was dropped
+    // here and bwnSlaMult never ran for List Heat at all. `slaScaled` was false on every
+    // row, which is why the Audit panel's "status limits: N of M scaled by the client SLA"
+    // line never appeared on a scan that HAD captured responseMinutes, and the whole v3.19
+    // client-SLA clock was inert on the board while the shared engine passed its own tests
+    // (those tests called bwnThresholdsFor directly, and the harness stub for this alias
+    // took four args - so 287 assertions ran green over a dead path).
+    // Measured on the shipped 1.66.29 bytes, status "Scheduled" / label "P2 Next Day" /
+    // sla { responseMinutes: 480 }: through this alias warn 15 / bad 30 / sla false, into
+    // the engine direct warn 10 / bad 20 / sla true.
+    function thresholdsFor(status, prioText, C, sla) { return bwnThresholdsFor(status, prioText, C, sla); }
 
     // ---- Per-row verdict: ONE source of truth (v3.15) ------------------------------
     // Pure fn - facts in, verdict out - so the DOM tinting pass, the API scan, and the
@@ -6500,12 +6544,11 @@
         reasons.push(msg);
         if (kind && kinds.indexOf(kind) === -1) kinds.push(kind);
       }
-      if (/complete|invoiced|closed|cancel/i.test(f.status || '')) return v;
-      // `phase` is the server's own lifecycle field and it is authoritative where the
-      // status NAME is free text: a custom terminal status nobody predicted still carries
-      // a terminal phase. Additive - the status regex above keeps its existing behaviour,
-      // and this only ever ADDS reasons to fall silent, never new alarms.
-      if (/^(closed|cancel|canceled|cancelled|declined|revoked)/i.test(String(f.phase || '').trim())) return v;
+      // Both signals, in one place (heatDone): a terminal phase silences a row whatever its
+      // status is called, an ACTIVE phase silences the status-name guess instead, and a row
+      // with no phase read (the DOM tinting pass has no phase column) judges on the name
+      // exactly as it always did.
+      if (heatDone(f.status, f.phase)) return v;
       v.over30 = !isNaN(f.ageDays) && f.ageDays > 30;
       var th = thresholdsFor(f.status, f.prio, C, f.sla);
       v.slaScaled = !!th.sla;
@@ -6815,10 +6858,24 @@
           var crd = parseUSDate(cellText(tr, H.created));
           if (crd !== null) ageDays = dSince(crd);
         }
+        // The board has no phase column, so the tint borrows the phase the API scan already
+        // read for THIS row (v3.22). Not a guess and not fabrication - same WO, same store
+        // record, a fact the row itself cannot show. Without it the counts would judge the
+        // row on its phase while the tint judged it on its status name, and a
+        // "Clocked Out: Complete" row would sit untinted inside a red count - the drift the
+        // one shared computeVerdict exists to make impossible. No API record (DOM-only scan)
+        // -> undefined -> the name regex decides, exactly as before.
+        var rowKey = heatKey(link.getAttribute('href'));
+        var apiRec = (heatStore && heatStore[rowKey] && heatStore[rowKey].src === 'api') ? heatStore[rowKey] : null;
         // Verdict via the shared computeVerdict (same fn the API scan + My Day use),
-        // so row tint, audit counts, and My Day can never disagree.
+        // so row tint, audit counts, and My Day can never disagree. `sla` rides along for
+        // the same reason `phase` does (v3.23): the board has no responseMinutes column,
+        // and once thresholdsFor actually honours the 4th arg, a tint that omitted it would
+        // judge the row on the label clock while the stored sev beside it came from the
+        // client's. Same WO, same store record - undefined on a DOM-only scan, as before.
         var vf = computeVerdict({
-          status: status, prio: prio, ageDays: ageDays,
+          status: status, prio: prio, phase: apiRec ? apiRec.phase : undefined, ageDays: ageDays,
+          sla: apiRec ? apiRec.sla : undefined,
           hrs: parseFloat(cellText(tr, H.hrs).replace(/,/g, '')),
           expTs: parseUSDate(cellText(tr, H.exp)),
           schedTs: parseUSDate(cellText(tr, H.sched)),
@@ -6876,7 +6933,7 @@
         } catch (eS) { /* best-effort */ }
 
         if (heatStore) {
-          heatStoreDomPut(heatKey(link.getAttribute('href')), {
+          heatStoreDomPut(rowKey, {
             id: rowId, kinds: kinds.slice(), acked: acked,
             sev: sev, reasons: reasons.slice(),
             wo: (link.textContent || '').trim() || cellText(tr, H.wo),
@@ -7000,7 +7057,7 @@
         var curS = { bad: 0, warn: 0, open: 0, over30: 0 };
         var bkt = { a: 0, b: 0, c: 0, d: 0 }, noHrs = 0, noNote = 0;
         entries.forEach(function (e) {
-          if (/complete|invoiced|closed|cancel/i.test(e.status || '')) return;
+          if (heatDone(e.status, e.phase)) return;
           curS.open++;
           if (e.sev === 2) curS.bad++; else if (e.sev === 1) curS.warn++;
           var ag = parseFloat(String(e.days || '').replace(/,/g, ''));
@@ -7775,7 +7832,7 @@
         var o = heatStore[k];
         var days = parseFloat(String(o.days || '').replace(/,/g, ''));
         if (isNaN(days) || days <= 30) return;
-        if (/complete|invoiced|closed|cancel/i.test(o.status || '')) return;
+        if (heatDone(o.status, o.phase)) return;
         jobs.push({
           href: k, wo: o.wo || '', tracking: o.tracking || '', client: o.client || '', status: o.status || '',
           prio: o.prio || '', days: Math.round(days), hrs: o.hrs || '', dne: o.dne || '',
@@ -7792,13 +7849,20 @@
     function myDayCounts() {
       var C = bwnConfig();
       var open = 0, over30 = 0, limitBad = 0, limitWatch = 0, stale = 0, total = 0, scanned = !!heatStore;
-      function done(status) { return /complete|invoiced|closed|cancel/i.test(status || ''); }
       function tally(o) {
         total++;
-        if (done(o.status)) return;
+        if (heatDone(o.status, o.phase)) return;
         open++;
+        // `phase` must travel with the row (v3.22). Without it the row passes the heatDone
+        // gate above on its phase and is then judged silent by the name regex INSIDE the
+        // engine - counted as open, but contributing nothing to any pill. That reads as
+        // "19 more open jobs and not one of them has a problem", which is worse than the
+        // bug it replaces.
+        // `sla` travels for the same reason (v3.23) - a stored API row carries the client's
+        // response clock, and the pills have to be counted against the SAME limit the row was
+        // tinted and ranked by. A DOM-built row has no sla key -> undefined -> the label parse.
         var vf = computeVerdict({
-          status: o.status, prio: o.prio,
+          status: o.status, prio: o.prio, phase: o.phase, sla: o.sla,
           ageDays: parseFloat(String(o.days || '').replace(/,/g, '')),
           hrs: parseFloat(String(o.hrs || '').replace(/,/g, '')),
           expTs: parseUSDate(o.exp), schedTs: parseUSDate(o.sched), lastNoteTs: parseUSDate(o.lastNote)
