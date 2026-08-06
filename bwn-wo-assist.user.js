@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         BWN WO Assist (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.3.0
-// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-wo-assist.user.js
-// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-wo-assist.user.js
+// @version      0.3.1
+// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-wo-assist.user.js
+// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-wo-assist.user.js
 // @description  Escalate a work order to management from inside Umbrava, and round-trip its state back onto the page. Pick why and say what you need; it POSTs to the broadway-internal-ops SWA proxy (x-bwn-key gated) which proves your Umbrava session token, injects your verified email as the requester, works out WHO it goes to from your rank (a coordinator escalates to a supervisor, a supervisor to management, a director owns the call), sets a due clock scaled by the job's priority, records the item in the shared assist queue, and only then sends the notify. Escalating the same work order twice while the first is still open is rejected server-side, so two tabs cannot double-fire. While an escalation is open, this script also reads its state back (op:'status') and publishes it on the suite bus, so the WO Assist checklist shows "Escalated - awaiting mgmt" and the drawer becomes an acknowledge/resolve panel instead of a duplicate form. Registers one "Escalate" entry in the shared dock tab and adds an Escalate button to the WO Assist checklist's escalation step; a Tampermonkey menu item opens it too, so it is never stranded. The flow's secret URL stays server-side; nothing sensitive lives in this script.
 // @match        https://app.umbrava.com/*
 // @run-at       document-idle

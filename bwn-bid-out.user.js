@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         BWN Bid-Out (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.26.0
-// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-bid-out.user.js
-// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-bid-out.user.js
+// @version      0.26.1
+// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-bid-out.user.js
+// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-bid-out.user.js
 // @description  Email RFP to outside / net-new vendors, launched from a caret on Umbrava's own "See Who Is Available" button (network-vendor bidding stays native - no separate Bid-Out button). The caret menu opens the tracked email RFP wizard: finds net-new vendors nearby through Google Places, looks up their emails via the BWN scrape-contacts function, takes pasted outside addresses, and can still include assignable Umbrava vendors in the same email. You pick who's included, then review the exact recipient list and the rendered email before anything sends. Send from your own mailbox via the SWA send-bid function (Microsoft Graph), or open a plain Outlook draft. Vendors are BCC'd; nothing sends until you click Send. Network access is limited to Umbrava (same-origin), Google Places, and your SWA host.
 // @match        https://app.umbrava.com/work-orders/*
 // @run-at       document-idle

@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         BWN Vendor Intake (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.9.2
-// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-vendor-intake.user.js
-// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-vendor-intake.user.js
+// @version      0.9.3
+// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-vendor-intake.user.js
+// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-vendor-intake.user.js
 // @description  Prefills Umbrava's Create Vendor form (and the detail-page Tax ID) from a Prospect Set-Up Form or a W-9. Fillable PDFs are read straight from their form fields; SCANNED W-9s are read by on-device OCR (Tesseract + pdf.js, fetched once at install, run entirely in the browser). The document and its tax ID never leave your machine. Adds a "Prefill from document" button; every extracted field is a suggestion to review before saving - the TIN especially, since OCR can misread digits.
 // @match        https://app.umbrava.com/*
 // @run-at       document-idle

@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         BWN CC Purchase (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.7.1
-// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-cc-purchase.user.js
-// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-cc-purchase.user.js
+// @version      0.7.2
+// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-cc-purchase.user.js
+// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-cc-purchase.user.js
 // @description  Replaces the "Log Credit Card Purchase Request" Microsoft Form with an in-page modal. Logging a purchase is a SUPERVISOR+ action (coordinators request via the CC Request form instead), and the server re-checks that rank on every submit - your Umbrava session token rides in the request body and the SWA proves it with Umbrava's own current-user API before forwarding. This script no longer draws its own floating button: the single Credit Card launcher is owned by bwn-cc-request, which shows a dropdown for supervisors+ and opens this modal over the bwn:evt bus (so there is only ever one button, never a stack). Fill the fields and submit; it POSTs to the broadway-internal-ops SWA proxy (x-bwn-key gated) which forwards to the HTTP-triggered Power Automate flow - logging a row to Credit Card Tracker.xlsx and emailing Mike, identically to the old Form. Opened on a work order, it prefills the Work Order # and drops the client/location into the description, and defaults Supplier to whichever PO line you flipped to "Supplier" in the BWN Ops Suite (falling back to the WO's vendors as suggestions). Card Used is a pick-list you maintain. An optional Receipt is uploaded (via /api/cc-receipt -> Graph) to the shared SharePoint folder and linked in the tracker. The flow's secret URL stays server-side; nothing sensitive lives in this script. Open it from the CC Request dropdown or the Tampermonkey menu.
 // @match        https://app.umbrava.com/*
 // @run-at       document-idle

@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         BWN WO Kanban (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.4.0
+// @version      0.4.1
 // @description  Turns Umbrava's Work Orders list into a kanban board without leaving the page. A Board/List toggle sits next to the list's own search box; switching to Board hides the table (the toolbar stays, so the app's own filtering still drives everything) and lays the same work orders out as cards in lanes. Lanes are WO Status by default and regroup to Priority, Assignee, Client or Age from a dropdown. The board never invents its own filter system - it captures the SPA's own PagedWorkOrders request (query, variables AND auth headers) off the wire and replays it with a larger page size, so whatever the list is filtered to (phase, statuses, search, assignee chips, sort) is exactly what the board shows, and changing a filter re-scans. Cards carry the triage picture: the status clock against the limit that WO was actually judged against, the reasons it is flagged, whether its onsite date has already passed, DNE vs vendor NTE with GP, vendors and trades. Severity is never computed here - it is read from the verdicts List Heat publishes in bwn-suite-core, so the board and the list can never disagree. Dragging a card between status lanes DOES change the work order, through Umbrava's own captured PatchWorkOrder mutation - it asks first, states that the WO's time-in-status clock will reset, verifies the server reported success, re-scans rather than trusting the optimistic move, and leaves the card where it was if anything fails. Everything is same-origin using the page's own session: no @connect, no keys, nothing leaves the browser.
-// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-kanban.user.js
-// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-kanban.user.js
+// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-kanban.user.js
+// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-kanban.user.js
 // @match        https://app.umbrava.com/*
 // @run-at       document-start
 // @noframes
@@ -26,7 +26,7 @@
   // update check another. There is no GM_info without a grant (and a grant would sandbox the
   // script away from the page's fetch - see the header note), so the fallback is a literal
   // that must be bumped WITH @version; the harness pins the two together.
-  var VER = '0.4.0';
+  var VER = '0.4.1';
   console.info('[BWN KANBAN] v' + VER + ' - board view over the captured PagedWorkOrders query; severity read from List Heat verdicts; drag between status lanes writes via captured PatchWorkOrder');
 
   // ---------------------------------------------------------------------------

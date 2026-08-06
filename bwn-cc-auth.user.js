@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         BWN CC Request (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.4.1
-// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-cc-auth.user.js
-// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-cc-auth.user.js
+// @version      0.4.2
+// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-cc-auth.user.js
+// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-cc-auth.user.js
 // @description  Replaces the "CC Authorization Form" Microsoft Form with an in-page CC Request modal. Requesting a card purchase is a coordinator action (any vouched Broadway Umbrava user): fill the fields and submit; it POSTs to the broadway-internal-ops SWA proxy (x-bwn-key gated) which proves your Umbrava session token with Umbrava's own current-user API, injects your verified email as the Requester, and forwards to the HTTP-triggered Power Automate flow "CC Authorization (HTTP)". That flow starts an approval (mnajarro@, GKohlmann@, LPorzelt@) and, on approve, emails you back that the order will be placed. This script OWNS the single Credit Card entry in the shared dock tab: coordinators and leads see just "CC Request"; supervisors and above get a dropdown that also opens the Supervisor-only "Log CC Purchase" modal (provided by bwn-cc-purchase, driven over the bwn:evt bus so there is only ever one button). Opened on a work order it prefills the Tracking # and drops the client/location into the description, and defaults Supplier to whichever PO line you flipped to "Supplier" in the BWN Ops Suite. The flow's secret URL stays server-side; nothing sensitive lives in this script.
 // @match        https://app.umbrava.com/*
 // @run-at       document-idle

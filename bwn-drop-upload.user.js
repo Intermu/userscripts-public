@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         BWN Drop Upload (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      1.10.0
-// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-drop-upload.user.js
-// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-drop-upload.user.js
+// @version      1.10.1
+// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-drop-upload.user.js
+// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-drop-upload.user.js
 // @description  Drop files anywhere on an Umbrava work order to upload them. Opens the Documents tab and upload dialog, hands over the files, and builds each file's description from its contents. Emails are parsed locally (.msg via an OLE/MAPI reader, .eml via RFC822) into an Outlook-style block - From/Sent/To/Cc/Subject and the body - that becomes the WO note, led by a one-line summary from Chrome's on-device built-in AI (zero cost, zero egress, nothing leaves the browser), falling back to local WO-field extraction (store, city/state, priority, PO, NTE, problem, requester) when the on-device model is unavailable. That same summary fills each file's Description. The WO note's Type is chosen from the email's parties: inbound is typed by the sender (client -> Client, else Vendor); outbound from Broadway is typed by the recipients (a client recipient -> Client, any vendor recipient -> Vendor, all-internal -> Internal). Umbrava's Description field is a locked react-aria combobox that rejects programmatic fills, so the description goes on your clipboard for a one-tap Ctrl+V. When WO Intake hands off a just-created WO's request email, each uploaded file's Label (document type) is set to "Work Order Request". You review and Save everything. Runs in the browser only: no network access, no grants.
 // @match        https://app.umbrava.com/*
 // @match        https://*.umbrava.com/*

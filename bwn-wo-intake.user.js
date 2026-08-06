@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         BWN WO Intake (Broadway National)
 // @namespace    broadwaynational.bwn
-// @version      0.9.1
-// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-wo-intake.user.js
-// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-wo-intake.user.js
+// @version      0.9.2
+// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-wo-intake.user.js
+// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-wo-intake.user.js
 // @description  Drop a client PO/WO email (.msg or .eml) onto the Create Work Order modal and it prefills the fields. Pilot Travel Centers: from the email body. Caleres (Famous Footwear / Corrigo): reads the attached WO PDF on-device for Trade, Scope, Priority, Due-By, Store, NTE. If a Caleres request has no WO PDF (image-only), it reads Store, City/State and Trade from the subject and the scope from the body (NTE + Priority stay manual - they live only in the images). Selects Client, Location (address-verified), Trade and Priority by clicking the real dropdown option; fills Client DNE, Source Job # and Source PO #; warns you if the WO PDF shows a cancel/flag note. Then, after you Create the WO, it hands the email to BWN Drop Upload to attach it to the new WO's Documents. Reads everything in the browser; nothing is uploaded to any server. Best-effort: review every field before you click Create.
 // @match        https://app.umbrava.com/*
 // @run-at       document-idle

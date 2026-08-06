@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BWN Ask (Coordinator Copilot)
 // @namespace    https://broadwaynational.com/bwn
-// @version      0.6.1
+// @version      0.6.2
 // @description  Ask questions about the work order you're viewing. Reads the WO live from Umbrava via same-origin GraphQL (details + full note / site-visit history) AND a summary roster of the other work orders at the same location, plus the team knowledge doc, and answers through the Broadway AI proxy with dates and references. Phase 1.5 = page-scoped + location roster (Path A); no data leaves the trusted Broadway path.
 // @match        https://app.umbrava.com/*
 // @run-at       document-idle
@@ -10,8 +10,8 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @connect      green-stone-0717dab0f.7.azurestaticapps.net
-// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-ask.user.js
-// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts-public/main/bwn-ask.user.js
+// @downloadURL  https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-ask.user.js
+// @updateURL    https://raw.githubusercontent.com/Intermu/userscripts/main/bwn-ask.user.js
 // ==/UserScript==
 
 /* eslint-disable */
